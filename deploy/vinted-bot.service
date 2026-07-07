@@ -1,0 +1,25 @@
+# systemd unit for a Linux VM (e.g. Oracle Cloud Always Free).
+# Runs the whole stack via docker compose and restarts on boot/crash.
+#
+# Install:
+#   sudo cp deploy/vinted-bot.service /etc/systemd/system/
+#   # edit WorkingDirectory below to your checkout path
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now vinted-bot
+#
+# Logs:  journalctl -u vinted-bot -f
+[Unit]
+Description=Vinted Telegram Bot (docker compose)
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vinted-telegram-bot
+ExecStart=/usr/bin/docker compose up
+ExecStop=/usr/bin/docker compose down
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

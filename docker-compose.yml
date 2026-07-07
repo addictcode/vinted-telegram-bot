@@ -1,0 +1,40 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vinted-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-vinted}
+      POSTGRES_USER: ${DB_USER:-vinted}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-vinted}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-vinted} -d ${DB_NAME:-vinted}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  bot:
+    build: .
+    container_name: vinted-bot
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN}
+      BOT_USERNAME: ${BOT_USERNAME:-vinted_parser_bot}
+      DB_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-vinted}
+      DB_USER: ${DB_USER:-vinted}
+      DB_PASSWORD: ${DB_PASSWORD:-vinted}
+      SELENIUM_ENABLED: ${SELENIUM_ENABLED:-true}
+      VINTED_PROXY: ${VINTED_PROXY:-}
+    volumes:
+      - image-cache:/tmp/vinted_images
+      - ./logs:/app/logs
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  image-cache:

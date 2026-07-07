@@ -1,0 +1,74 @@
+spring:
+  application:
+    name: vinted-telegram-bot
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/vinted}
+    username: ${DB_USER:vinted}
+    password: ${DB_PASSWORD:vinted}
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+    locations: classpath:db/migration
+
+telegram:
+  bot:
+    # NEVER hardcode the token. Provide it via the BOT_TOKEN environment variable.
+    token: ${BOT_TOKEN:}
+    username: ${BOT_USERNAME:vinted_parser_bot}
+
+vinted:
+  parser:
+    # Primary parsing is lightweight HTTP (Jsoup). Headless Chrome is only a
+    # fallback and can be disabled on minimal hosts that have no browser.
+    selenium-enabled: ${SELENIUM_ENABLED:true}
+    # Use headless Chrome for JS-rendered content.
+    headless: true
+    # Explicit chromedriver path (optional). If empty, WebDriverManager resolves it.
+    chrome-driver-path: ${CHROME_DRIVER_PATH:}
+    chrome-binary-path: ${CHROME_BINARY_PATH:}
+    page-load-timeout-seconds: 30
+    # Delay between outbound requests, randomised in [min,max] milliseconds.
+    min-delay-ms: 2000
+    max-delay-ms: 5000
+    # Network retry attempts on failure.
+    max-retries: 3
+    # Optional HTTP/SOCKS proxy, e.g. http://user:pass@host:port
+    proxy: ${VINTED_PROXY:}
+    image-cache-dir: ${IMAGE_CACHE_DIR:/tmp/vinted_images}
+    referer: https://www.vinted.com/
+    accept-language: en-US,en;q=0.9
+  monitor:
+    # Near-real-time polling of saved catalog searches via Vinted's JSON API
+    # (~40 KB per poll). New listings are pushed to the chat within seconds.
+    enabled: ${MONITOR_ENABLED:true}
+    interval-ms: ${MONITOR_INTERVAL_MS:20000}    # 20 seconds
+    initial-delay-ms: 15000
+    max-new-per-cycle: 5
+    per-page: 24
+    backoff-ms: ${MONITOR_BACKOFF_MS:180000}     # pause after anti-bot block
+
+rate-limit:
+  free-requests-per-hour: 10
+
+logging:
+  level:
+    root: INFO
+    com.example.vintedbot: DEBUG
+    org.openqa.selenium: WARN
+  file:
+    name: logs/vinted-bot.log
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} %-5level [%thread] %logger{36} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} %-5level [%thread] %logger{36} - %msg%n"
+
+server:
+  shutdown: graceful

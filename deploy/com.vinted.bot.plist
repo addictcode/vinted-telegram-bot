@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd agent: keeps the bot running and restarts it on crash/login.
+  This is the zero-cost option, but your Mac must be awake for the bot to poll.
+
+  Install:
+    # edit the two paths below to your checkout location
+    cp deploy/com.vinted.bot.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.vinted.bot.plist
+    launchctl start com.vinted.bot
+  Stop:
+    launchctl unload ~/Library/LaunchAgents/com.vinted.bot.plist
+
+  Tip: to keep polling while the lid is closed, run `caffeinate -s` or disable
+  App Nap / sleep for this process.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.vinted.bot</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/dmitrijsajbakov/Desktop/12345678/vinted-telegram-bot/deploy/run-local.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/dmitrijsajbakov/Desktop/12345678/vinted-telegram-bot</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/dmitrijsajbakov/Desktop/12345678/vinted-telegram-bot/logs/launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/dmitrijsajbakov/Desktop/12345678/vinted-telegram-bot/logs/launchd.err.log</string>
+</dict>
+</plist>

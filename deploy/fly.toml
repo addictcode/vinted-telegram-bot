@@ -1,0 +1,27 @@
+# Fly.io config for the slim (Chrome-free) deployment.
+#   fly launch --no-deploy      # once, to create the app (pick a name)
+#   fly secrets set BOT_TOKEN=xxx BOT_USERNAME=yourbot DB_URL=... DB_USER=... DB_PASSWORD=...
+#   fly deploy
+# Use a free Postgres from Neon (neon.tech) or Supabase and point DB_URL at it.
+app = "vinted-bot"
+primary_region = "fra"
+
+[build]
+  dockerfile = "../Dockerfile.slim"
+
+[env]
+  SELENIUM_ENABLED = "false"
+
+# Long-polling bot: no inbound HTTP, keep exactly one instance always running.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+[deploy]
+  strategy = "immediate"
+
+# Do NOT auto-stop — the bot must stay alive to poll Telegram.
+[http_service]
+  auto_stop_machines = false
+  auto_start_machines = false
+  min_machines_running = 1

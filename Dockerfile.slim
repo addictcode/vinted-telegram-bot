@@ -1,0 +1,23 @@
+# Lightweight image WITHOUT Chrome — pure-HTTP (Jsoup) parsing only.
+# Ideal for tiny free hosts (Fly.io / Koyeb / Railway). ~200 MB, runs in 256 MB RAM.
+# Selenium fallback is disabled; if a datacenter IP gets challenged, set VINTED_PROXY.
+
+# ---- Build stage ----
+FROM maven:3.9-eclipse-temurin-17 AS build
+WORKDIR /app
+COPY pom.xml .
+RUN mvn -q dependency:go-offline
+COPY src ./src
+RUN mvn -q clean package -DskipTests
+
+# ---- Runtime stage ----
+FROM eclipse-temurin:17-jre-jammy
+WORKDIR /app
+
+ENV SELENIUM_ENABLED=false \
+    IMAGE_CACHE_DIR=/tmp/vinted_images \
+    JAVA_OPTS="-XX:MaxRAMPercentage=75"
+
+COPY --from=build /app/target/vinted-telegram-bot-*.jar app.jar
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /app/app.jar"]

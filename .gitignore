@@ -1,0 +1,8 @@
+target/
+logs/
+.env
+*.log
+.idea/
+*.iml
+.DS_Store
+/tmp/vinted_images/

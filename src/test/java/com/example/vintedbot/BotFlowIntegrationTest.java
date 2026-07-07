@@ -1,0 +1,443 @@
+package com.example.vintedbot;
+
+import com.example.vintedbot.bot.VintedTelegramBot;
+import com.example.vintedbot.config.*;
+import com.example.vintedbot.dto.CatalogItemSummary;
+import com.example.vintedbot.dto.VintedItem;
+import com.example.vintedbot.repository.*;
+import com.example.vintedbot.service.*;
+import com.example.vintedbot.util.UserAgentRotator;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
+import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
+import org.springframework.test.context.ActiveProfiles;
+import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
+import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.objects.*;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/**
+ * Drives the real bot end-to-end: synthetic Telegram updates in, replies and DB
+ * effects out. The parser is stubbed (no network) and the Telegram send layer is
+ * captured via the {@code dispatch} seam.
+ */
+@DataJpaTest
+@ActiveProfiles("test")
+@AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
+class BotFlowIntegrationTest {
+
+    @Autowired UserRepository userRepository;
+    @Autowired UserSubscriptionRepository subscriptionRepository;
+    @Autowired WatchedItemRepository watchedItemRepository;
+    @Autowired ParsedItemRepository parsedItemRepository;
+    @Autowired SearchSubscriptionRepository searchSubscriptionRepository;
+
+    private static final long CHAT_ID = 555L;
+    private CapturingBot bot;
+    private SearchSubscriptionService searchSubs;
+    private SearchMonitorService monitor;
+    private StubParser stubParser;
+    private StubApiClient stubApi;
+    private final List<SendMessage> sent = new ArrayList<>();
+    private final List<AnswerCallbackQuery> acks = new ArrayList<>();
+
+    /** Bot subclass that captures outgoing messages instead of hitting Telegram. */
+    static class CapturingBot extends VintedTelegramBot {
+        final List<SendMessage> sent; final List<AnswerCallbackQuery> acks;
+        int nextThreadId = 4242;
+        Integer createdThreadFor;
+        CapturingBot(BotProperties bp, UserService us, RateLimitService rl, VintedParserService ps,
+                     VintedApiClient api, HistoryService hs, WatchlistService ws,
+                     SearchSubscriptionService ss, SearchMonitorService ms, MessageFormatter mf,
+                     List<SendMessage> sent, List<AnswerCallbackQuery> acks) {
+            super(bp, us, rl, ps, api, hs, ws, ss, ms, mf);
+            this.sent = sent; this.acks = acks;
+        }
+        @Override protected void dispatch(SendMessage m) { sent.add(m); }
+        @Override protected void dispatch(AnswerCallbackQuery a) { acks.add(a); }
+        @Override protected Integer createForumTopic(Long chatId, String name) {
+            createdThreadFor = nextThreadId;
+            return nextThreadId;
+        }
+    }
+
+    /** Parser stub: no network. URLs containing "fail" throw NOT_FOUND. */
+    static class StubParser extends VintedParserService {
+        /** Mutable "current catalog page" the stub returns (HTML fallback path). */
+        List<String> catalogPage = new ArrayList<>();
+        StubParser(VintedParserProperties p) {
+            super(p, new WebDriverFactory(p, new WebDriverFactory.UserAgentRotatorHolder(new UserAgentRotator())),
+                    new UserAgentRotator(), new ImageCacheService(p), new ObjectMapper());
+        }
+        @Override public VintedItem parseVintedUrl(String url) {
+            if (url.contains("fail")) {
+                throw new VintedParseException(VintedParseException.Reason.NOT_FOUND, "not found");
+            }
+            return VintedItem.builder().url(url).title("Item " + url.replaceAll("\\D+", ""))
+                    .price(42.0).currency("EUR").brand("Nike").size("M")
+                    .condition("Good").color("Black").imageUrls(List.of()).build();
+        }
+        @Override public List<String> fetchCatalogItemUrls(String catalogUrl) {
+            return new ArrayList<>(catalogPage);
+        }
+    }
+
+    /** API client stub: serves summaries built from a mutable URL list. */
+    static class StubApiClient extends VintedApiClient {
+        List<String> page = new ArrayList<>();
+        boolean fail = false;
+        StubApiClient(VintedParserProperties p, ObjectMapper m) {
+            super(p, new UserAgentRotator(), m);
+        }
+        @Override public List<CatalogItemSummary> fetchCatalog(String catalogUrl, int perPage) {
+            if (fail) throw new VintedParseException(VintedParseException.Reason.UNKNOWN, "api down");
+            List<CatalogItemSummary> out = new ArrayList<>();
+            for (String url : page) {
+                String id = url.replaceAll("\\D+", "");
+                out.add(CatalogItemSummary.builder()
+                        .id(id).url(url).title("Item " + id)
+                        .price(42.0).currency("EUR").brand("Nike").size("M")
+                        .condition("Good").build());
+            }
+            return out;
+        }
+    }
+
+    @BeforeEach
+    void setUp() {
+        VintedParserProperties pp = new VintedParserProperties();
+        pp.setMinDelayMs(0); pp.setMaxDelayMs(0);
+        RateLimitProperties rlp = new RateLimitProperties(); rlp.setFreeRequestsPerHour(100);
+        BotProperties bp = new BotProperties(); bp.setToken("test"); bp.setUsername("testbot");
+        MonitorProperties mp = new MonitorProperties();
+        ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
+
+        UserService userService = new UserService(userRepository, subscriptionRepository);
+        RateLimitService rateLimit = new RateLimitService(rlp);
+        HistoryService history = new HistoryService(parsedItemRepository, mapper);
+        WatchlistService watchlist = new WatchlistService(watchedItemRepository);
+        MessageFormatter formatter = new MessageFormatter();
+        stubParser = new StubParser(pp);
+        stubApi = new StubApiClient(pp, mapper);
+        searchSubs = new SearchSubscriptionService(searchSubscriptionRepository, mapper);
+        monitor = new SearchMonitorService(searchSubs, stubApi, stubParser, history,
+                userRepository, formatter, mp);
+
+        bot = new CapturingBot(bp, userService, rateLimit, stubParser, stubApi,
+                history, watchlist, searchSubs, monitor, formatter, sent, acks);
+    }
+
+    // --------- update builders ---------
+    private Update groupCatalog(String body, boolean forum) {
+        Chat chat = new Chat(); chat.setId(CHAT_ID); chat.setType("supergroup");
+        chat.setTitle("Test Group"); chat.setIsForum(forum);
+        User from = new User(); from.setId(999L); from.setUserName("tester"); from.setIsBot(false); from.setFirstName("T");
+        Message m = new Message(); m.setChat(chat); m.setFrom(from); m.setText(body);
+        Update u = new Update(); u.setMessage(m); return u;
+    }
+
+    private Update text(String body) {
+        Chat chat = new Chat(); chat.setId(CHAT_ID); chat.setType("private");
+        User from = new User(); from.setId(CHAT_ID); from.setUserName("tester"); from.setIsBot(false); from.setFirstName("T");
+        Message m = new Message(); m.setChat(chat); m.setFrom(from); m.setText(body);
+        Update u = new Update(); u.setMessage(m); return u;
+    }
+    private Update callback(String data) {
+        Chat chat = new Chat(); chat.setId(CHAT_ID); chat.setType("private");
+        User from = new User(); from.setId(CHAT_ID); from.setUserName("tester"); from.setIsBot(false); from.setFirstName("T");
+        Message m = new Message(); m.setChat(chat); m.setFrom(from);
+        CallbackQuery cq = new CallbackQuery(); cq.setId("cb"); cq.setData(data); cq.setFrom(from); cq.setMessage(m);
+        Update u = new Update(); u.setCallbackQuery(cq); return u;
+    }
+    private String lastText() { return sent.get(sent.size() - 1).getText(); }
+
+    // --------- tests ---------
+
+    @Test
+    void start_registersUserAndGreets() {
+        bot.onUpdateReceived(text("/start"));
+        assertThat(userRepository.findByChatId(CHAT_ID)).isPresent();
+        assertThat(lastText()).contains("Привет");
+    }
+
+    @Test
+    void singleLink_parsesSavesAndOffersSaveButton() {
+        bot.onUpdateReceived(text("https://www.vinted.com/items/123-x"));
+        // "parsing…" + card
+        SendMessage card = sent.get(sent.size() - 1);
+        assertThat(card.getText()).contains("Item 123").contains("€42");
+        assertThat(card.getReplyMarkup()).isNotNull();               // ⭐ save button
+        assertThat(parsedItemRepository.count()).isEqualTo(1);       // saved to history
+    }
+
+    @Test
+    void multipleLinks_parseAllWithSummary() {
+        bot.onUpdateReceived(text("https://www.vinted.com/items/1-a\nhttps://www.vinted.com/items/2-b"));
+        assertThat(parsedItemRepository.count()).isEqualTo(2);
+        assertThat(sent).anyMatch(m -> m.getText().contains("Готово"));
+    }
+
+    @Test
+    void failedLink_reportsError() {
+        bot.onUpdateReceived(text("https://www.vinted.com/items/999-fail"));
+        assertThat(lastText()).contains("не найдено").containsIgnoringCase("не найдено");
+        assertThat(parsedItemRepository.count()).isZero();
+    }
+
+    @Test
+    void watchCommand_addsToWatchlist() {
+        bot.onUpdateReceived(text("/watch https://www.vinted.com/items/7-w"));
+        assertThat(watchedItemRepository.count()).isEqualTo(1);
+        assertThat(sent).anyMatch(m -> m.getText().contains("Item 7"));
+    }
+
+    @Test
+    void list_showsWatchlistWithButtons() {
+        bot.onUpdateReceived(text("/watch https://www.vinted.com/items/8-w"));
+        sent.clear();
+        bot.onUpdateReceived(text("/list"));
+        SendMessage listMsg = sent.get(sent.size() - 1);
+        assertThat(listMsg.getText()).contains("Мой список");
+        assertThat(listMsg.getReplyMarkup()).isNotNull();
+    }
+
+    @Test
+    void saveCallback_addsParsedItemToWatchlist() {
+        bot.onUpdateReceived(text("https://www.vinted.com/items/50-x"));
+        Long parsedId = parsedItemRepository.findAll().get(0).getId();
+        bot.onUpdateReceived(callback("save:" + parsedId));
+        assertThat(watchedItemRepository.count()).isEqualTo(1);
+        assertThat(acks).isNotEmpty();
+    }
+
+    @Test
+    void editLabelFlow_updatesLabel() {
+        bot.onUpdateReceived(text("/watch https://www.vinted.com/items/60-x"));
+        Long watchId = watchedItemRepository.findAll().get(0).getId();
+        bot.onUpdateReceived(callback("wl:edit:" + watchId));   // arms pending edit
+        bot.onUpdateReceived(text("Моя ссылка"));               // supplies new label
+        assertThat(watchedItemRepository.findById(watchId).orElseThrow().getLabel())
+                .isEqualTo("Моя ссылка");
+    }
+
+    @Test
+    void deleteCallback_removesWatchedItem() {
+        bot.onUpdateReceived(text("/watch https://www.vinted.com/items/70-x"));
+        Long watchId = watchedItemRepository.findAll().get(0).getId();
+        bot.onUpdateReceived(callback("wl:del:" + watchId));
+        assertThat(watchedItemRepository.count()).isZero();
+    }
+
+    // ------------------------------------------ catalog search subscriptions
+
+    private static final String CATALOG_URL =
+            "https://www.vinted.de/catalog?search_text=swear&order=newest_first&page=1&time=1783208420";
+
+    @Test
+    void catalogLink_sendsThreeFreshestAndSubscribes() {
+        stubApi.page = List.of(
+                "https://www.vinted.de/items/101-a", "https://www.vinted.de/items/102-b",
+                "https://www.vinted.de/items/103-c", "https://www.vinted.de/items/104-d");
+
+        bot.onUpdateReceived(text(CATALOG_URL));
+
+        // 3 freshest cards sent (in page order), subscription created.
+        long cards = sent.stream().filter(m -> m.getText().contains("Item 10")).count();
+        assertThat(cards).isEqualTo(3);
+        assertThat(sent).anyMatch(m -> m.getText().contains("Подписка создана"));
+        assertThat(searchSubscriptionRepository.count()).isEqualTo(1);
+        // Volatile params (time/page) stripped from the stored URL.
+        assertThat(searchSubscriptionRepository.findAll().get(0).getCatalogUrl())
+                .doesNotContain("time=").doesNotContain("page=")
+                .contains("search_text=swear").contains("order=newest_first");
+        // All 4 page ids seeded as seen.
+        assertThat(searchSubscriptionRepository.findAll().get(0).getSeenItemIds())
+                .contains("101").contains("104");
+    }
+
+    @Test
+    void duplicateCatalogLink_reportsAlreadySubscribed() {
+        stubApi.page = List.of("https://www.vinted.de/items/1-a");
+        bot.onUpdateReceived(text(CATALOG_URL));
+        sent.clear();
+        bot.onUpdateReceived(text(CATALOG_URL));
+        assertThat(sent).anyMatch(m -> m.getText().contains("уже подписаны"));
+        assertThat(searchSubscriptionRepository.count()).isEqualTo(1);
+    }
+
+    @Test
+    void monitor_pushesOnlyNewListings() {
+        stubApi.page = new ArrayList<>(List.of(
+                "https://www.vinted.de/items/201-a", "https://www.vinted.de/items/202-b"));
+        bot.onUpdateReceived(text(CATALOG_URL));   // subscribes, seeds 201+202
+        sent.clear();
+
+        // Nothing new yet → no pushes.
+        assertThat(monitor.checkAll()).isZero();
+        assertThat(sent).isEmpty();
+
+        // Two new listings appear at the top of the search.
+        stubApi.page = List.of(
+                "https://www.vinted.de/items/204-new", "https://www.vinted.de/items/203-new",
+                "https://www.vinted.de/items/201-a", "https://www.vinted.de/items/202-b");
+        assertThat(monitor.checkAll()).isEqualTo(2);
+        assertThat(sent).hasSize(2);
+        assertThat(sent.get(0).getText()).contains("Новое объявление").contains("Item 204");
+        assertThat(sent.get(1).getText()).contains("Item 203");
+
+        // Same page again → already seen, no repeats.
+        sent.clear();
+        assertThat(monitor.checkAll()).isZero();
+        assertThat(sent).isEmpty();
+    }
+
+    @Test
+    void monitor_fallsBackToHtmlWhenApiFails() {
+        stubApi.page = new ArrayList<>(List.of("https://www.vinted.de/items/501-a"));
+        bot.onUpdateReceived(text(CATALOG_URL));   // subscribe via API, seeds 501
+        sent.clear();
+
+        // API goes down; HTML page shows one new listing.
+        stubApi.fail = true;
+        stubParser.catalogPage = List.of(
+                "https://www.vinted.de/items/502-new", "https://www.vinted.de/items/501-a");
+        assertThat(monitor.checkAll()).isEqualTo(1);
+        assertThat(sent).hasSize(1);
+        assertThat(sent.get(0).getText()).contains("Новое объявление").contains("Item 502");
+    }
+
+    @Test
+    void subCheckNowCallback_reportsNoNews() {
+        stubApi.page = List.of("https://www.vinted.de/items/301-a");
+        bot.onUpdateReceived(text(CATALOG_URL));
+        Long subId = searchSubscriptionRepository.findAll().get(0).getId();
+        sent.clear();
+        bot.onUpdateReceived(callback("sub:chk:" + subId));
+        assertThat(sent).anyMatch(m -> m.getText().contains("пока нет"));
+    }
+
+    @Test
+    void subEditAndDelete_flow() {
+        stubApi.page = List.of("https://www.vinted.de/items/401-a");
+        bot.onUpdateReceived(text(CATALOG_URL));
+        Long subId = searchSubscriptionRepository.findAll().get(0).getId();
+
+        bot.onUpdateReceived(callback("sub:edit:" + subId));
+        bot.onUpdateReceived(text("Свитера swear"));
+        assertThat(searchSubscriptionRepository.findById(subId).orElseThrow().getLabel())
+                .isEqualTo("Свитера swear");
+
+        bot.onUpdateReceived(callback("sub:del:" + subId));
+        assertThat(searchSubscriptionRepository.count()).isZero();
+    }
+
+    @Test
+    void groupForum_createsTopicAndSubscribesWithThread() {
+        stubApi.page = List.of("https://www.vinted.de/items/601-a", "https://www.vinted.de/items/602-b");
+        bot.onUpdateReceived(groupCatalog(CATALOG_URL, true));
+
+        // A forum topic was created and the subscription stored the thread id.
+        assertThat(bot.createdThreadFor).isEqualTo(4242);
+        var sub = searchSubscriptionRepository.findAll().get(0);
+        assertThat(sub.getChatId()).isEqualTo(CHAT_ID);
+        assertThat(sub.getMessageThreadId()).isEqualTo(4242L);
+        assertThat(sub.getChatTitle()).isEqualTo("Test Group");
+        // Preview messages were delivered into the created topic thread.
+        assertThat(sent).anyMatch(m -> "4242".equals(m.getMessageThreadId() == null ? null
+                : String.valueOf(m.getMessageThreadId())));
+
+        // New listing pushed into the topic thread.
+        sent.clear();
+        stubApi.page = List.of("https://www.vinted.de/items/603-new",
+                "https://www.vinted.de/items/601-a", "https://www.vinted.de/items/602-b");
+        assertThat(monitor.checkAll()).isEqualTo(1);
+        SendMessage push = sent.get(sent.size() - 1);
+        assertThat(push.getMessageThreadId()).isEqualTo(4242);
+        assertThat(push.getText()).contains("Item 603");
+    }
+
+    @Test
+    void groupNonForum_subscribesToGroupChatNoThread() {
+        stubApi.page = List.of("https://www.vinted.de/items/701-a");
+        bot.onUpdateReceived(groupCatalog(CATALOG_URL, false));
+        var sub = searchSubscriptionRepository.findAll().get(0);
+        assertThat(sub.getChatId()).isEqualTo(CHAT_ID);
+        assertThat(sub.getMessageThreadId()).isNull();
+    }
+
+    @Test
+    void pauseResumeSubscription() {
+        stubApi.page = List.of("https://www.vinted.de/items/801-a");
+        bot.onUpdateReceived(text(CATALOG_URL));
+        Long subId = searchSubscriptionRepository.findAll().get(0).getId();
+
+        bot.onUpdateReceived(callback("sub:tgl:" + subId));   // pause
+        assertThat(searchSubscriptionRepository.findById(subId).orElseThrow().isActive()).isFalse();
+
+        // Paused subs are excluded from monitoring.
+        stubApi.page = List.of("https://www.vinted.de/items/802-new",
+                "https://www.vinted.de/items/801-a");
+        assertThat(monitor.checkAll()).isZero();
+
+        bot.onUpdateReceived(callback("sub:tgl:" + subId));   // resume
+        assertThat(searchSubscriptionRepository.findById(subId).orElseThrow().isActive()).isTrue();
+    }
+
+    @Test
+    void menuButtonCaptionRoutesToCommand() {
+        bot.onUpdateReceived(text("/start"));
+        sent.clear();
+        bot.onUpdateReceived(text("🔔 Мои подписки"));   // reply-keyboard caption
+        assertThat(sent).anyMatch(m -> m.getText().contains("нет подписок")
+                || m.getText().contains("Подписки на поиск"));
+    }
+
+    @Test
+    void addMenu_guidedSearchFlow() {
+        stubApi.page = List.of("https://www.vinted.de/items/901-a");
+        // Open the add menu, choose "track search", then supply the link.
+        bot.onUpdateReceived(text("/add"));
+        assertThat(sent).anyMatch(m -> m.getText().contains("Что добавить"));
+        bot.onUpdateReceived(callback("add:search"));
+        assertThat(sent).anyMatch(m -> m.getText().contains("ссылку на"));
+        bot.onUpdateReceived(text(CATALOG_URL));
+        // The link supplied after the prompt created a subscription.
+        assertThat(searchSubscriptionRepository.count()).isEqualTo(1);
+    }
+
+    @Test
+    void addMenu_rejectsNonLinkAfterPrompt() {
+        bot.onUpdateReceived(callback("add:search"));
+        sent.clear();
+        bot.onUpdateReceived(text("привет"));
+        assertThat(sent).anyMatch(m -> m.getText().contains("не похоже на ссылку"));
+        assertThat(searchSubscriptionRepository.count()).isZero();
+    }
+
+    @Test
+    void searchCommandWithLink_subscribesInGroupEvenWithoutBareMessages() {
+        stubApi.page = List.of("https://www.vinted.de/items/905-a");
+        // In groups only commands reach the bot; /search must work.
+        bot.onUpdateReceived(groupCatalog("/search " + CATALOG_URL, false));
+        assertThat(searchSubscriptionRepository.count()).isEqualTo(1);
+        assertThat(searchSubscriptionRepository.findAll().get(0).getChatId()).isEqualTo(CHAT_ID);
+    }
+
+    @Test
+    void labelDerivedFromSearchText() {
+        assertThat(VintedTelegramBot.labelFromCatalogUrl(
+                "https://www.vinted.de/catalog?search_text=nike+air&order=newest_first"))
+                .isEqualTo("Поиск: nike air");
+        assertThat(VintedTelegramBot.labelFromCatalogUrl(
+                "https://www.vinted.de/catalog?brand_ids[]=53"))
+                .isEqualTo("Vinted поиск");
+    }
+}

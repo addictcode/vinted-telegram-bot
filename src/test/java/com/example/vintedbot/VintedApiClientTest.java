@@ -58,5 +58,31 @@ class VintedApiClientTest {
         // Second item: url derived from path, price absent.
         assertThat(items.get(1).getUrl()).isEqualTo("https://www.vinted.de/items/123-x");
         assertThat(items.get(1).getPrice()).isNull();
+        assertThat(items.get(1).getUploadedAt()).isNull();
+    }
+
+    @Test
+    void parseItems_readsUploadTimeFromPhotoTimestamp() throws Exception {
+        String json = """
+                {"items":[{"id":1,"title":"x","path":"/items/1-x",
+                  "photo":{"url":"https://images1.vinted.net/p.jpg",
+                           "high_resolution":{"id":"abc","timestamp":1788268518}}}]}
+                """;
+        CatalogItemSummary item = client.parseItems(json, "www.vinted.de").get(0);
+        assertThat(item.getUploadedAt()).isEqualTo(java.time.Instant.ofEpochSecond(1788268518));
+    }
+
+    @Test
+    void proxyPool_parsesValidEntriesAndSkipsGarbage() {
+        VintedParserProperties p = new VintedParserProperties();
+        p.setProxies("http://user:p%40ss@10.0.0.1:8000, socks5://10.0.0.2:1080 , not a proxy");
+        p.setProxy("10.0.0.3:3128");
+        VintedApiClient pooled = new VintedApiClient(p, new UserAgentRotator(), new ObjectMapper());
+        assertThat(pooled.endpointCount()).isEqualTo(3);
+    }
+
+    @Test
+    void noProxiesConfigured_goesDirect() {
+        assertThat(client.endpointCount()).isEqualTo(1);
     }
 }

@@ -13,6 +13,14 @@ class MessageFormatterTest {
     private final MessageFormatter formatter = new MessageFormatter();
 
     @Test
+    void cardCaption_showsSizeBrandAndListingAge() {
+        var card = new com.example.vintedbot.dto.ListingCard(null, "Hoodie", 12.0, "EUR",
+                "https://www.vinted.de/items/1", "M", "Nike", java.time.Instant.now().minusSeconds(7));
+        String caption = formatter.cardCaption(card, null);
+        assertThat(caption).contains("€12").contains(" · M").contains(" · Nike").contains("сек назад");
+    }
+
+    @Test
     void formatItem_includesKeyFieldsAndEscapesHtml() {
         VintedItem item = VintedItem.builder()
                 .url("https://www.vinted.com/items/1")

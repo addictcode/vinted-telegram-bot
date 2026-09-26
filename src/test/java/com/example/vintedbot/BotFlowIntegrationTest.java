@@ -17,6 +17,7 @@ import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.test.context.ActiveProfiles;
 import org.telegram.telegrambots.meta.api.methods.AnswerCallbackQuery;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.objects.*;
 
 import java.util.ArrayList;
@@ -44,6 +45,7 @@ class BotFlowIntegrationTest {
     private CapturingBot bot;
     private SearchSubscriptionService searchSubs;
     private SearchMonitorService monitor;
+    private MonitorProperties monitorProps;
     private StubParser stubParser;
     private StubApiClient stubApi;
     private final List<SendMessage> sent = new ArrayList<>();
@@ -52,6 +54,7 @@ class BotFlowIntegrationTest {
     /** Bot subclass that captures outgoing messages instead of hitting Telegram. */
     static class CapturingBot extends VintedTelegramBot {
         final List<SendMessage> sent; final List<AnswerCallbackQuery> acks;
+        final List<SendPhoto> photos = new ArrayList<>();
         int nextThreadId = 4242;
         Integer createdThreadFor;
         CapturingBot(BotProperties bp, UserService us, RateLimitService rl, VintedParserService ps,
@@ -62,6 +65,7 @@ class BotFlowIntegrationTest {
             this.sent = sent; this.acks = acks;
         }
         @Override protected void dispatch(SendMessage m) { sent.add(m); }
+        @Override protected void dispatch(SendPhoto p) { photos.add(p); }
         @Override protected void dispatch(AnswerCallbackQuery a) { acks.add(a); }
         @Override protected Integer createForumTopic(Long chatId, String name) {
             createdThreadFor = nextThreadId;
@@ -94,18 +98,32 @@ class BotFlowIntegrationTest {
     static class StubApiClient extends VintedApiClient {
         List<String> page = new ArrayList<>();
         boolean fail = false;
+        boolean withPhoto = false;
+        int calls = 0;
+        /** Host that should simulate an anti-bot BLOCKED response; others unaffected. */
+        String blockedHost = null;
+        /** Per-host page override; hosts not present here fall back to {@link #page}. */
+        java.util.Map<String, List<String>> pageByHost = new java.util.HashMap<>();
         StubApiClient(VintedParserProperties p, ObjectMapper m) {
             super(p, new UserAgentRotator(), m);
         }
         @Override public List<CatalogItemSummary> fetchCatalog(String catalogUrl, int perPage) {
+            calls++;
             if (fail) throw new VintedParseException(VintedParseException.Reason.UNKNOWN, "api down");
+            String host = java.net.URI.create(catalogUrl.trim()).getHost();
+            if (blockedHost != null && blockedHost.equals(host)) {
+                throw new VintedParseException(VintedParseException.Reason.BLOCKED, "blocked");
+            }
+            List<String> urls = pageByHost.getOrDefault(host, page);
             List<CatalogItemSummary> out = new ArrayList<>();
-            for (String url : page) {
+            for (String url : urls) {
                 String id = url.replaceAll("\\D+", "");
                 out.add(CatalogItemSummary.builder()
                         .id(id).url(url).title("Item " + id)
                         .price(42.0).currency("EUR").brand("Nike").size("M")
-                        .condition("Good").build());
+                        .condition("Good")
+                        .photoUrl(withPhoto ? "https://images.vinted.net/" + id + ".jpg" : null)
+                        .build());
             }
             return out;
         }
@@ -118,6 +136,7 @@ class BotFlowIntegrationTest {
         RateLimitProperties rlp = new RateLimitProperties(); rlp.setFreeRequestsPerHour(100);
         BotProperties bp = new BotProperties(); bp.setToken("test"); bp.setUsername("testbot");
         MonitorProperties mp = new MonitorProperties();
+        monitorProps = mp;
         ObjectMapper mapper = new ObjectMapper().registerModule(new JavaTimeModule());
 
         UserService userService = new UserService(userRepository, subscriptionRepository);
@@ -129,7 +148,7 @@ class BotFlowIntegrationTest {
         stubApi = new StubApiClient(pp, mapper);
         searchSubs = new SearchSubscriptionService(searchSubscriptionRepository, mapper);
         monitor = new SearchMonitorService(searchSubs, stubApi, stubParser, history,
-                userRepository, formatter, mp);
+                userRepository, mp);
 
         bot = new CapturingBot(bp, userService, rateLimit, stubParser, stubApi,
                 history, watchlist, searchSubs, monitor, formatter, sent, acks);
@@ -240,6 +259,8 @@ class BotFlowIntegrationTest {
 
     private static final String CATALOG_URL =
             "https://www.vinted.de/catalog?search_text=swear&order=newest_first&page=1&time=1783208420";
+    private static final String CATALOG_URL_FR =
+            "https://www.vinted.fr/catalog?search_text=swear&order=newest_first&page=1&time=1783208420";
 
     @Test
     void catalogLink_sendsThreeFreshestAndSubscribes() {
@@ -290,7 +311,7 @@ class BotFlowIntegrationTest {
                 "https://www.vinted.de/items/201-a", "https://www.vinted.de/items/202-b");
         assertThat(monitor.checkAll()).isEqualTo(2);
         assertThat(sent).hasSize(2);
-        assertThat(sent.get(0).getText()).contains("Новое объявление").contains("Item 204");
+        assertThat(sent.get(0).getText()).contains("Item 204");
         assertThat(sent.get(1).getText()).contains("Item 203");
 
         // Same page again → already seen, no repeats.
@@ -311,7 +332,47 @@ class BotFlowIntegrationTest {
                 "https://www.vinted.de/items/502-new", "https://www.vinted.de/items/501-a");
         assertThat(monitor.checkAll()).isEqualTo(1);
         assertThat(sent).hasSize(1);
-        assertThat(sent.get(0).getText()).contains("Новое объявление").contains("Item 502");
+        assertThat(sent.get(0).getText()).contains("Item 502");
+    }
+
+    @Test
+    void monitor_hostBackoffOnlyAffectsThatHost() {
+        stubApi.pageByHost.put("www.vinted.de", new ArrayList<>(List.of("https://www.vinted.de/items/301-a")));
+        stubApi.pageByHost.put("www.vinted.fr", new ArrayList<>(List.of("https://www.vinted.fr/items/401-a")));
+
+        bot.onUpdateReceived(text(CATALOG_URL));       // subscribes to .de, seeds 301
+        bot.onUpdateReceived(text(CATALOG_URL_FR));    // subscribes to .fr, seeds 401
+        sent.clear();
+
+        // .de gets blocked; .fr still has a fresh listing and must still be delivered.
+        stubApi.blockedHost = "www.vinted.de";
+        stubApi.pageByHost.put("www.vinted.fr", List.of(
+                "https://www.vinted.fr/items/402-new", "https://www.vinted.fr/items/401-a"));
+
+        assertThat(monitor.checkAll()).isEqualTo(1);
+        assertThat(sent).hasSize(1);
+        assertThat(sent.get(0).getText()).contains("Item 402");
+    }
+
+    @Test
+    void snipeMode_fastSubComesAroundWhileNormalOneWaits() {
+        stubApi.page = new ArrayList<>(List.of("https://www.vinted.de/items/1001-a"));
+        bot.onUpdateReceived(text(CATALOG_URL));       // normal
+        bot.onUpdateReceived(text(CATALOG_URL_FR));    // to be switched to snipe mode
+        Long frId = searchSubscriptionRepository.findAll().stream()
+                .filter(s -> s.getCatalogUrl().contains("vinted.fr")).findFirst().orElseThrow().getId();
+
+        bot.onUpdateReceived(callback("sub:fast:" + frId));
+        assertThat(searchSubscriptionRepository.findById(frId).orElseThrow().isFast()).isTrue();
+
+        monitorProps.setSnipeIntervalMs(0);            // snipe subs are due again immediately
+        stubApi.calls = 0;
+        monitor.checkDue();                            // first tick: both are due
+        assertThat(stubApi.calls).isEqualTo(2);
+
+        stubApi.calls = 0;
+        monitor.checkDue();                            // normal one waits its 20 s, snipe one goes again
+        assertThat(stubApi.calls).isEqualTo(1);
     }
 
     @Test
@@ -429,6 +490,39 @@ class BotFlowIntegrationTest {
         bot.onUpdateReceived(groupCatalog("/search " + CATALOG_URL, false));
         assertThat(searchSubscriptionRepository.count()).isEqualTo(1);
         assertThat(searchSubscriptionRepository.findAll().get(0).getChatId()).isEqualTo(CHAT_ID);
+    }
+
+    @Test
+    void listingCard_sentAsPhotoWithCaptionAndLinkButton() {
+        stubApi.withPhoto = true;
+        stubApi.page = List.of("https://www.vinted.de/items/950-a");
+        bot.onUpdateReceived(text(CATALOG_URL));
+
+        // At least one photo card was sent, with a compact caption + link button.
+        assertThat(bot.photos).isNotEmpty();
+        var photo = bot.photos.get(0);
+        assertThat(photo.getCaption()).contains("Item 950").contains("€42");
+        // Caption is compact: title + price only, no description/condition lines.
+        assertThat(photo.getCaption()).doesNotContain("Состояние").doesNotContain("Описание");
+        // A URL button linking to the listing is present.
+        var kb = ((org.telegram.telegrambots.meta.api.objects.replykeyboard.InlineKeyboardMarkup)
+                photo.getReplyMarkup()).getKeyboard();
+        assertThat(kb.stream().flatMap(List::stream))
+                .anyMatch(b -> b.getUrl() != null && b.getUrl().contains("/items/950"));
+    }
+
+    @Test
+    void monitorPush_photoCardGoesToCorrectThread() {
+        stubApi.withPhoto = true;
+        stubApi.page = new ArrayList<>(List.of("https://www.vinted.de/items/960-a"));
+        bot.onUpdateReceived(groupCatalog(CATALOG_URL, true));   // forum topic 4242
+        bot.photos.clear();
+        stubApi.page = List.of("https://www.vinted.de/items/961-new",
+                "https://www.vinted.de/items/960-a");
+        assertThat(monitor.checkAll()).isEqualTo(1);
+        assertThat(bot.photos).hasSize(1);
+        assertThat(bot.photos.get(0).getMessageThreadId()).isEqualTo(4242);
+        assertThat(bot.photos.get(0).getCaption()).contains("Item 961");
     }
 
     @Test

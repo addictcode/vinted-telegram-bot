@@ -10,8 +10,14 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public class MonitorProperties {
 
     private boolean enabled = true;
-    /** How often to poll subscriptions (near-real-time via the JSON API). */
+    /** How often to poll normal subscriptions (near-real-time via the JSON API). */
     private long intervalMs = 20_000;
+    /** How often to poll snipe-mode ("fast") subscriptions. */
+    private long snipeIntervalMs = 5_000;
+    /** Safe request budget per outbound IP per minute; snipe interval is stretched to respect it. */
+    private int requestsPerMinutePerIp = 20;
+    /** Scheduler tick: how often we look for subscriptions that are due. */
+    private long tickMs = 1_000;
     private long initialDelayMs = 15_000;
     /** Max new listings pushed per subscription per cycle (anti-flood). */
     private int maxNewPerCycle = 5;
@@ -19,4 +25,8 @@ public class MonitorProperties {
     private int perPage = 24;
     /** Pause after an anti-bot block before polling resumes. */
     private long backoffMs = 180_000;
+    /** Total concurrent subscription checks across all hosts. */
+    private int maxConcurrentChecks = 8;
+    /** Concurrent checks allowed against the same Vinted host (anti-burst cap). */
+    private int maxConcurrentPerHost = 2;
 }

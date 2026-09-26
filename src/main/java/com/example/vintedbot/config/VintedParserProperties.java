@@ -23,6 +23,10 @@ public class VintedParserProperties {
     private long maxDelayMs = 5000;
     private int maxRetries = 3;
     private String proxy = "";
+    /** Comma-separated proxy pool for the catalog API poller, e.g. {@code http://u:p@h1:8000,http://u:p@h2:8000}. */
+    private String proxies = "";
+    /** How long a proxy that got blocked is skipped for that Vinted domain. */
+    private long proxyCooldownMs = 120_000;
     private String imageCacheDir = "/tmp/vinted_images";
     private String referer = "https://www.vinted.com/";
     private String acceptLanguage = "en-US,en;q=0.9";

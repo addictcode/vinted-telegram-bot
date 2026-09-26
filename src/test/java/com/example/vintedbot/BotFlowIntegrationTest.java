@@ -365,7 +365,8 @@ class BotFlowIntegrationTest {
         bot.onUpdateReceived(callback("sub:fast:" + frId));
         assertThat(searchSubscriptionRepository.findById(frId).orElseThrow().isFast()).isTrue();
 
-        monitorProps.setSnipeIntervalMs(0);            // snipe subs are due again immediately
+        monitorProps.setSnipeMinIntervalMs(0);         // no floor, and a huge request budget,
+        monitorProps.setRequestsPerMinutePerIp(1_000_000); // so snipe subs are due again immediately
         stubApi.calls = 0;
         monitor.checkDue();                            // first tick: both are due
         assertThat(stubApi.calls).isEqualTo(2);

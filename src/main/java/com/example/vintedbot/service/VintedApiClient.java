@@ -10,12 +10,18 @@ import org.jsoup.Connection;
 import org.jsoup.Jsoup;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.Authenticator;
 import java.net.InetSocketAddress;
 import java.net.PasswordAuthentication;
 import java.net.Proxy;
 import java.net.URI;
 import java.net.URLDecoder;
+import java.net.ProxySelector;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -27,6 +33,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.GZIPInputStream;
 
 /**
  * Lightweight client for Vinted's internal catalog JSON API
@@ -48,12 +55,21 @@ public class VintedApiClient {
     /** Proxy credentials by "host:port", consulted by the JVM-wide Authenticator. */
     private static final Map<String, PasswordAuthentication> PROXY_CREDENTIALS = new ConcurrentHashMap<>();
     private static final AtomicBoolean AUTHENTICATOR_INSTALLED = new AtomicBoolean();
+    /** Answers proxy auth challenges from the credentials parsed out of proxy URLs. */
+    private static final Authenticator PROXY_AUTHENTICATOR = new Authenticator() {
+        @Override
+        protected PasswordAuthentication getPasswordAuthentication() {
+            return PROXY_CREDENTIALS.get(getRequestingHost() + ":" + getRequestingPort());
+        }
+    };
 
     private final VintedParserProperties props;
     private final UserAgentRotator userAgentRotator;
     private final ObjectMapper objectMapper;
     /** Outbound routes: DIRECT, or one per configured proxy. */
     private final List<Endpoint> endpoints;
+    /** One keep-alive HTTP/2 client per endpoint (none for SOCKS — java.net.http can't tunnel via SOCKS). */
+    private final Map<String, HttpClient> httpClients;
     private final AtomicInteger roundRobin = new AtomicInteger();
     private final ConcurrentHashMap<String, Session> sessions = new ConcurrentHashMap<>();
     /** Per (endpoint, domain) cool-down after a block, so rotation skips burnt routes. */
@@ -75,6 +91,7 @@ public class VintedApiClient {
         this.userAgentRotator = userAgentRotator;
         this.objectMapper = objectMapper;
         this.endpoints = buildEndpoints(props);
+        this.httpClients = buildHttpClients(endpoints);
         if (endpoints.get(0).proxy() != null) {
             log.info("Vinted API client rotating across {} proxy endpoint(s)", endpoints.size());
         }
@@ -155,20 +172,9 @@ public class VintedApiClient {
         Session session = obtainSession(host, ep);
         String api = "https://" + host + "/api/v2/catalog/items?" + apiQuery(rawQuery, perPage);
 
-        Connection.Response res = connect(api, ep)
-                .userAgent(session.userAgent())
-                .header("Cookie", cookieHeader(session.cookies()))
-                .header("Accept", "application/json, text/plain, */*")
-                .header("Accept-Language", props.getAcceptLanguage())
-                .referrer("https://" + host + "/catalog")
-                .ignoreContentType(true)
-                .ignoreHttpErrors(true)
-                .maxBodySize(0)
-                .timeout(TIMEOUT_MS)
-                .method(Connection.Method.GET)
-                .execute();
+        HttpResult res = get(ep, api, session, "https://" + host + "/catalog");
 
-        int code = res.statusCode();
+        int code = res.status();
         if (code == 401 || code == 403 || code == 429) {
             sessions.remove(key(ep, host));
             if (retryOnAuthFail && code != 429) {
@@ -184,6 +190,51 @@ public class VintedApiClient {
                     "Catalog API returned HTTP " + code);
         }
         return parseItems(res.body(), host);
+    }
+
+    record HttpResult(int status, String body) {
+    }
+
+    /** Hot-path GET: reuses the endpoint's keep-alive client; SOCKS endpoints fall back to Jsoup. */
+    private HttpResult get(Endpoint ep, String url, Session session, String referer) throws Exception {
+        String cookie = cookieHeader(session.cookies());
+        HttpClient client = httpClients.get(ep.key());
+        if (client == null) {
+            Connection.Response r = connect(url, ep)
+                    .userAgent(session.userAgent())
+                    .header("Cookie", cookie)
+                    .header("Accept", "application/json, text/plain, */*")
+                    .header("Accept-Language", props.getAcceptLanguage())
+                    .referrer(referer)
+                    .ignoreContentType(true)
+                    .ignoreHttpErrors(true)
+                    .maxBodySize(0)
+                    .timeout(TIMEOUT_MS)
+                    .method(Connection.Method.GET)
+                    .execute();
+            return new HttpResult(r.statusCode(), r.body());
+        }
+        HttpRequest.Builder req = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofMillis(TIMEOUT_MS))
+                .header("User-Agent", session.userAgent())
+                .header("Accept", "application/json, text/plain, */*")
+                .header("Accept-Language", props.getAcceptLanguage())
+                .header("Accept-Encoding", "gzip")
+                .header("Referer", referer)
+                .GET();
+        if (!cookie.isEmpty()) req.header("Cookie", cookie);
+        return send(client, req.build());
+    }
+
+    /** Sends a request and decodes a gzip body (java.net.http doesn't decompress on its own). */
+    static HttpResult send(HttpClient client, HttpRequest request) throws IOException, InterruptedException {
+        HttpResponse<InputStream> resp = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        InputStream in = resp.body();
+        boolean gzip = resp.headers().firstValue("Content-Encoding")
+                .map(v -> v.equalsIgnoreCase("gzip")).orElse(false);
+        try (InputStream body = gzip ? new GZIPInputStream(in) : in) {
+            return new HttpResult(resp.statusCode(), new String(body.readAllBytes(), StandardCharsets.UTF_8));
+        }
     }
 
     /**
@@ -316,12 +367,24 @@ public class VintedApiClient {
 
     private static void installAuthenticator() {
         if (!AUTHENTICATOR_INSTALLED.compareAndSet(false, true)) return;
-        Authenticator.setDefault(new Authenticator() {
-            @Override
-            protected PasswordAuthentication getPasswordAuthentication() {
-                return PROXY_CREDENTIALS.get(getRequestingHost() + ":" + getRequestingPort());
+        Authenticator.setDefault(PROXY_AUTHENTICATOR);
+    }
+
+    private static Map<String, HttpClient> buildHttpClients(List<Endpoint> endpoints) {
+        Map<String, HttpClient> clients = new ConcurrentHashMap<>();
+        for (Endpoint ep : endpoints) {
+            if (ep.proxy() != null && ep.proxy().type() != Proxy.Type.HTTP) continue;
+            HttpClient.Builder b = HttpClient.newBuilder()
+                    .version(HttpClient.Version.HTTP_2)
+                    .connectTimeout(Duration.ofMillis(TIMEOUT_MS))
+                    .followRedirects(HttpClient.Redirect.NEVER);
+            if (ep.proxy() != null) {
+                b.proxy(ProxySelector.of((InetSocketAddress) ep.proxy().address()))
+                        .authenticator(PROXY_AUTHENTICATOR);
             }
-        });
+            clients.put(ep.key(), b.build());
+        }
+        return clients;
     }
 
     private static String nullToEmpty(String s) {
@@ -425,10 +488,15 @@ public class VintedApiClient {
         return n.isValueNode() && !n.isNull() && !n.asText().isBlank() ? n.asText() : null;
     }
 
-    /** Light pacing so API polling doesn't look machine-gun regular. */
+    /**
+     * Light pacing so polling doesn't look machine-gun regular. It exists to space
+     * requests on one IP; with N rotating IPs each one is already hit N× less often,
+     * so the pause shrinks accordingly instead of taxing every poll.
+     */
     private void jitter() {
+        int n = endpoints.size();
         try {
-            Thread.sleep(ThreadLocalRandom.current().nextLong(250, 750));
+            Thread.sleep(ThreadLocalRandom.current().nextLong(250 / n, 750 / n + 1));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }

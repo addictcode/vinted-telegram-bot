@@ -102,8 +102,14 @@ public class SearchMonitorService {
      * every request spends the per-IP budget Vinted tolerates before blocking.
      */
     long snipeIntervalMs(long fastSubs, long normalSubs, int ipCount) {
-        // TODO(Dmitry): make this budget-aware — see the task in chat.
-        return props.getSnipeIntervalMs();
+        if (fastSubs <= 0) return props.getIntervalMs();
+        double budgetPerMin = (double) props.getRequestsPerMinutePerIp() * Math.max(1, ipCount);
+        double normalPerMin = normalSubs * 60_000.0 / props.getIntervalMs();
+        double sparePerMin = budgetPerMin - normalPerMin;
+        // No spare budget: polling faster would only get the IPs banned, so no snipe advantage.
+        if (sparePerMin <= 0) return props.getIntervalMs();
+        long interval = (long) Math.ceil(fastSubs * 60_000.0 / sparePerMin);
+        return Math.max(props.getSnipeMinIntervalMs(), Math.min(interval, props.getIntervalMs()));
     }
 
     /** Proactively refreshes soon-to-expire sessions off the hot delivery path. */
@@ -172,7 +178,8 @@ public class SearchMonitorService {
             }
         }
         try {
-            List<CatalogItemSummary> summaries = apiClient.fetchCatalog(sub.getCatalogUrl(), props.getPerPage());
+            int perPage = sub.isFast() ? props.getSnipePerPage() : props.getPerPage();
+            List<CatalogItemSummary> summaries = apiClient.fetchCatalog(sub.getCatalogUrl(), perPage);
             return new FetchResult(sub, summaries, false, false, false);
         } catch (VintedParseException e) {
             if (e.getReason() == VintedParseException.Reason.BLOCKED) {
@@ -266,11 +273,15 @@ public class SearchMonitorService {
         if (target != null && notifier != null) {
             for (CatalogItemSummary s : fresh) {
                 if (sent >= props.getMaxNewPerCycle()) break;
+                long sendStart = System.currentTimeMillis();
                 notifier.sendCard(target, null, ListingCard.of(s));
+                long telegramMs = System.currentTimeMillis() - sendStart;
                 if (s.getUploadedAt() != null) {
                     // The real speed metric: time from Vinted upload to our Telegram push.
-                    log.info("Sub {}: item {} pushed {} s after upload", sub.getId(), s.getId(),
-                            Duration.between(s.getUploadedAt(), Instant.now()).toSeconds());
+                    log.info("Sub {}: item {} pushed {} s after upload (telegram {} ms)", sub.getId(), s.getId(),
+                            Duration.between(s.getUploadedAt(), Instant.now()).toSeconds(), telegramMs);
+                } else {
+                    log.info("Sub {}: item {} pushed (telegram {} ms)", sub.getId(), s.getId(), telegramMs);
                 }
                 saveToHistory(sub.getUserId(), s);
                 sent++;

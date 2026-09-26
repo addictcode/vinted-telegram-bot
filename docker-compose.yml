@@ -1,23 +1,27 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     container_name: vinted-postgres
     environment:
       POSTGRES_DB: ${DB_NAME:-vinted}
       POSTGRES_USER: ${DB_USER:-vinted}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-vinted}
+    # Bound to localhost only: on a VPS a published 5432 would expose the DB to the internet.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-vinted} -d ${DB_NAME:-vinted}"]
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
   bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.slim
     container_name: vinted-bot
     depends_on:
       postgres:
@@ -28,13 +32,15 @@ services:
       DB_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-vinted}
       DB_USER: ${DB_USER:-vinted}
       DB_PASSWORD: ${DB_PASSWORD:-vinted}
-      SELENIUM_ENABLED: ${SELENIUM_ENABLED:-true}
+      SELENIUM_ENABLED: "false"
       VINTED_PROXY: ${VINTED_PROXY:-}
+      VINTED_PROXIES: ${VINTED_PROXIES:-}
+      MONITOR_RPM_PER_IP: ${MONITOR_RPM_PER_IP:-20}
+      JAVA_OPTS: ${JAVA_OPTS:--XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=25 -XX:MaxMetaspaceSize=128m -XX:+ExitOnOutOfMemoryError}
+    mem_limit: 1g
     volumes:
-      - image-cache:/tmp/vinted_images
       - ./logs:/app/logs
     restart: unless-stopped
 
 volumes:
   pgdata:
-  image-cache:

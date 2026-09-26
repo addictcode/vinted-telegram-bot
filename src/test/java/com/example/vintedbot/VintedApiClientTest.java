@@ -82,6 +82,13 @@ class VintedApiClientTest {
     }
 
     @Test
+    void parseItems_failsLoudlyWhenResponseShapeChanges() {
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                () -> client.parseItems("{\"results\":[]}", "www.vinted.de"))
+                .isInstanceOf(com.example.vintedbot.service.VintedParseException.class);
+    }
+
+    @Test
     void noProxiesConfigured_goesDirect() {
         assertThat(client.endpointCount()).isEqualTo(1);
     }

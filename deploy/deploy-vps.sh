@@ -20,7 +20,7 @@ echo "==> Docker on $HOST"
 
 echo "==> Syncing code"
 rsync -az --delete \
-  --exclude target --exclude .git --exclude .env --exclude backups --exclude logs \
+  --exclude target --exclude .git --exclude .env --exclude backups --exclude logs --exclude proxies.txt \
   --exclude .idea --exclude .settings --exclude .classpath --exclude .project --exclude .factorypath \
   -e "ssh -o StrictHostKeyChecking=accept-new" ./ "$HOST:$DIR/"
 

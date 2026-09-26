@@ -60,6 +60,8 @@ vinted:
     snipe-per-page: ${MONITOR_SNIPE_PER_PAGE:10}
     requests-per-minute-per-ip: ${MONITOR_RPM_PER_IP:20}  # budget = this × number of proxies
     tick-ms: ${MONITOR_TICK_MS:250}                         # how often due subscriptions are picked up
+    block-alert-after-ms: ${MONITOR_BLOCK_ALERT_AFTER_MS:600000}  # tell the owner if a host stays blocked
+    alert-chat-id: ${ALERT_CHAT_ID:}                        # default: first registered user's chat
     initial-delay-ms: 15000
     max-new-per-cycle: 5
     per-page: 24

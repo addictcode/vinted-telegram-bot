@@ -10,4 +10,7 @@ public interface UserRepository extends JpaRepository<User, Long> {
     Optional<User> findByChatId(Long chatId);
 
     boolean existsByChatId(Long chatId);
+
+    /** The first user to register — treated as the bot owner for operational alerts. */
+    Optional<User> findFirstByOrderByIdAsc();
 }

@@ -18,6 +18,10 @@ public class MonitorProperties {
     private int snipePerPage = 10;
     /** Safe request budget per outbound IP per minute; snipe interval is stretched to respect it. */
     private int requestsPerMinutePerIp = 20;
+    /** Alert the owner when a Vinted host stays blocked this long. */
+    private long blockAlertAfterMs = 600_000;
+    /** Chat for operational alerts; defaults to the first registered user's chat. */
+    private Long alertChatId;
     /** Scheduler tick: how often we look for subscriptions that are due. */
     private long tickMs = 250;
     private long initialDelayMs = 15_000;

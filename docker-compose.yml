@@ -5,7 +5,7 @@ services:
     environment:
       POSTGRES_DB: ${DB_NAME:-vinted}
       POSTGRES_USER: ${DB_USER:-vinted}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-vinted}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
     # Bound to localhost only: on a VPS a published 5432 would expose the DB to the internet.
     ports:
       - "127.0.0.1:5432:5432"
@@ -31,7 +31,7 @@ services:
       BOT_USERNAME: ${BOT_USERNAME:-vinted_parser_bot}
       DB_URL: jdbc:postgresql://postgres:5432/${DB_NAME:-vinted}
       DB_USER: ${DB_USER:-vinted}
-      DB_PASSWORD: ${DB_PASSWORD:-vinted}
+      DB_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
       SELENIUM_ENABLED: "false"
       VINTED_PROXY: ${VINTED_PROXY:-}
       VINTED_PROXIES: ${VINTED_PROXIES:-}
@@ -39,8 +39,9 @@ services:
       JAVA_OPTS: ${JAVA_OPTS:--XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=25 -XX:MaxMetaspaceSize=128m -XX:+ExitOnOutOfMemoryError}
     mem_limit: 1g
     volumes:
-      - ./logs:/app/logs
+      - botlogs:/app/logs
     restart: unless-stopped
 
 volumes:
   pgdata:
+  botlogs:

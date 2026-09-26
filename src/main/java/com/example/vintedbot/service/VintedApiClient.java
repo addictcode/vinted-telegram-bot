@@ -59,6 +59,8 @@ public class VintedApiClient {
     private static final Authenticator PROXY_AUTHENTICATOR = new Authenticator() {
         @Override
         protected PasswordAuthentication getPasswordAuthentication() {
+            // Proxy challenges only: never hand proxy credentials to an origin server's 401.
+            if (getRequestorType() != RequestorType.PROXY) return null;
             return PROXY_CREDENTIALS.get(getRequestingHost() + ":" + getRequestingPort());
         }
     };
@@ -72,6 +74,7 @@ public class VintedApiClient {
     private final Map<String, HttpClient> httpClients;
     private final AtomicInteger roundRobin = new AtomicInteger();
     private final ConcurrentHashMap<String, Session> sessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Object> bootstrapLocks = new ConcurrentHashMap<>();
     /** Per (endpoint, domain) cool-down after a block, so rotation skips burnt routes. */
     private final ConcurrentHashMap<String, Instant> coolingUntil = new ConcurrentHashMap<>();
 
@@ -249,6 +252,17 @@ public class VintedApiClient {
         if (cached != null && !cached.expired()) {
             return cached;
         }
+        // Single-flight per (endpoint, host): parallel polls must not both spend the 6-hop bootstrap.
+        synchronized (bootstrapLocks.computeIfAbsent(sessionKey, k -> new Object())) {
+            cached = sessions.get(sessionKey);
+            if (cached != null && !cached.expired()) {
+                return cached;
+            }
+            return bootstrapSession(host, ep, sessionKey);
+        }
+    }
+
+    private Session bootstrapSession(String host, Endpoint ep, String sessionKey) throws Exception {
         String ua = userAgentRotator.random();
         Map<String, String> jar = new java.util.LinkedHashMap<>();
         String url = "https://" + host + "/";
@@ -335,6 +349,9 @@ public class VintedApiClient {
         for (String spec : specs) {
             Endpoint ep = parseProxy(spec);
             if (ep != null) out.add(ep);
+        }
+        if (out.isEmpty() && !specs.isEmpty()) {
+            log.error("Proxies are configured but none could be parsed — polling DIRECT, expect IP bans");
         }
         return out.isEmpty() ? List.of(Endpoint.DIRECT) : List.copyOf(out);
     }
@@ -439,6 +456,11 @@ public class VintedApiClient {
     public List<CatalogItemSummary> parseItems(String json, String host) throws Exception {
         JsonNode root = objectMapper.readTree(json);
         JsonNode items = root.path("items");
+        if (!items.isArray()) {
+            // Response shape changed: fail loudly (→ HTML fallback + log) instead of reading as "nothing new".
+            throw new VintedParseException(VintedParseException.Reason.UNKNOWN,
+                    "Catalog API response has no items array");
+        }
         List<CatalogItemSummary> out = new ArrayList<>();
         for (JsonNode it : items) {
             String url = it.path("url").asText("");

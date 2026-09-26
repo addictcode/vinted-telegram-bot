@@ -1,6 +1,7 @@
 package com.example.vintedbot.service;
 
 import com.example.vintedbot.dto.CatalogItemSummary;
+import com.example.vintedbot.dto.ListingCard;
 import com.example.vintedbot.dto.VintedItem;
 import com.example.vintedbot.model.ParsedItem;
 import com.example.vintedbot.model.SearchSubscription;
@@ -52,6 +53,34 @@ public class MessageFormatter {
                 TIME.format(item.getParsedAt()));
     }
 
+    /**
+     * Compact caption for a photo card: title, price · size · brand, and listing
+     * age (+ optional header). Used as the photo caption, and as the text body
+     * when no photo is available.
+     */
+    public String cardCaption(ListingCard card, String header) {
+        StringBuilder sb = new StringBuilder();
+        if (header != null && !header.isBlank()) {
+            sb.append(header).append("\n");
+        }
+        sb.append("👗 <b>").append(esc(orDash(card.title()))).append("</b>\n");
+        sb.append("💰 <b>").append(formatPrice(card.price(), card.currency())).append("</b>");
+        if (card.size() != null && !card.size().isBlank()) sb.append(" · ").append(esc(card.size()));
+        if (card.brand() != null && !card.brand().isBlank()) sb.append(" · ").append(esc(card.brand()));
+        if (card.uploadedAt() != null) {
+            sb.append("\n⏱ ").append(formatAge(java.time.Duration.between(card.uploadedAt(), java.time.Instant.now())));
+        }
+        return sb.toString();
+    }
+
+    /** "12 сек назад" / "4 мин назад" / "2 ч назад" — how fresh a listing is. */
+    static String formatAge(java.time.Duration age) {
+        long s = Math.max(0, age.toSeconds());
+        if (s < 60) return s + " сек назад";
+        if (s < 3600) return (s / 60) + " мин назад";
+        return (s / 3600) + " ч назад";
+    }
+
     /** Compact card built from catalog-API data (no item-page fetch → instant). */
     public String formatSummary(CatalogItemSummary s) {
         StringBuilder sb = new StringBuilder();
@@ -75,7 +104,7 @@ public class MessageFormatter {
         String name = s.getLabel() != null && !s.getLabel().isBlank() ? s.getLabel() : "Vinted поиск";
         StringBuilder sb = new StringBuilder();
         sb.append("<b>").append(index).append(".</b> ")
-                .append(s.isActive() ? "🔔 " : "⏸ ").append(esc(name));
+                .append(s.isActive() ? (s.isFast() ? "⚡ " : "🔔 ") : "⏸ ").append(esc(name));
         if (!s.isActive()) sb.append(" <i>(на паузе)</i>");
         if (s.getChatTitle() != null && !s.getChatTitle().isBlank()) {
             sb.append(s.getMessageThreadId() != null ? " · 🧵 тема в «" : " · 👥 «")

@@ -11,6 +11,9 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 public class VintedBotApplication {
 
     public static void main(String[] args) {
+        // The JDK disables Basic auth for HTTPS proxy tunnels by default; authenticated
+        // proxies need it. Must be set before the first HttpURLConnection is created.
+        System.setProperty("jdk.http.auth.tunneling.disabledSchemes", "");
         SpringApplication.run(VintedBotApplication.class, args);
     }
 }

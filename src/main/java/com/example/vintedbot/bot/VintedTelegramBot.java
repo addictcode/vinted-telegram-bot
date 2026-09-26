@@ -2,6 +2,7 @@ package com.example.vintedbot.bot;
 
 import com.example.vintedbot.config.BotProperties;
 import com.example.vintedbot.dto.CatalogItemSummary;
+import com.example.vintedbot.dto.ListingCard;
 import com.example.vintedbot.dto.SendTarget;
 import com.example.vintedbot.dto.VintedItem;
 import com.example.vintedbot.model.ParsedItem;
@@ -19,9 +20,11 @@ import org.telegram.telegrambots.meta.api.methods.ParseMode;
 import org.telegram.telegrambots.meta.api.methods.commands.SetMyCommands;
 import org.telegram.telegrambots.meta.api.methods.forum.CreateForumTopic;
 import org.telegram.telegrambots.meta.api.methods.send.SendMessage;
+import org.telegram.telegrambots.meta.api.methods.send.SendPhoto;
 import org.telegram.telegrambots.meta.api.objects.CallbackQuery;
 import org.telegram.telegrambots.meta.api.objects.Chat;
 import org.telegram.telegrambots.meta.api.objects.ChatMemberUpdated;
+import org.telegram.telegrambots.meta.api.objects.InputFile;
 import org.telegram.telegrambots.meta.api.objects.Message;
 import org.telegram.telegrambots.meta.api.objects.Update;
 import org.telegram.telegrambots.meta.api.objects.commands.BotCommand;
@@ -106,12 +109,12 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
         this.subscriptionService = subscriptionService;
         this.monitorService = monitorService;
         this.formatter = formatter;
-        monitorService.setNotifier(this::sendExternal);
+        monitorService.setNotifier(this::pushCard);
     }
 
-    /** Delivery channel the monitor uses to push into a chat/topic. */
-    public void sendExternal(SendTarget target, String html) {
-        send(target, html);
+    /** Delivery channel the monitor uses to push a listing into a chat/topic. */
+    public void pushCard(SendTarget target, String header, ListingCard card) {
+        sendListingCard(target, card, header, null);
     }
 
     @Override
@@ -384,9 +387,11 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
                     WatchlistService.AddResult r =
                             watchlistService.add(user.getId(), item.getUrl(), null, item);
                     if (r == WatchlistService.AddResult.ADDED) added++;
-                    send(reply, formatter.formatItem(item), saveOrManageKeyboard(saved.getId(), r));
+                    // Already saved to the watchlist → link button only.
+                    sendListingCard(reply, ListingCard.of(item), null, null);
                 } else {
-                    send(reply, formatter.formatItem(item), saveButton(saved.getId()));
+                    // Link button + "⭐ В список" save button.
+                    sendListingCard(reply, ListingCard.of(item), null, saved.getId());
                 }
                 ok++;
             } catch (VintedParseException e) {
@@ -459,7 +464,7 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
                 int n = Math.min(CATALOG_PREVIEW_COUNT, summaries.size());
                 send(target, "🆕 Свежие объявления (" + n + " из " + summaries.size() + "):", null);
                 for (int i = 0; i < n; i++) {
-                    send(target, formatter.formatSummary(summaries.get(i)), null);
+                    sendListingCard(target, ListingCard.of(summaries.get(i)), null, null);
                 }
             }
             previewSent = true;
@@ -480,8 +485,6 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
                     + "фильтру буду присылать автоматически (обычно в течение секунд).\n"
                     + "Управление: /subs", null);
             case ALREADY_EXISTS -> send(target, "ℹ️ Вы уже подписаны на этот фильтр. /subs", null);
-            case LIMIT_REACHED -> send(target, "⚠️ Достигнут лимит подписок ("
-                    + SearchSubscriptionService.MAX_PER_USER + "). Удалите лишние: /subs", null);
         }
     }
 
@@ -511,7 +514,7 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
                 try {
                     VintedItem item = parserService.parseVintedUrl(itemUrls.get(i));
                     historyService.save(user.getId(), item);
-                    send(target, formatter.formatItem(item), null);
+                    sendListingCard(target, ListingCard.of(item), null, null);
                 } catch (Exception e) {
                     log.warn("Catalog preview parse failed for {}: {}", itemUrls.get(i), e.getMessage());
                 }
@@ -573,6 +576,7 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
             String toggle = s.isActive() ? "⏸" : "▶️";
             rows.add(List.of(
                     button("🔄 #" + (i + 1), "sub:chk:" + s.getId()),
+                    button(s.isFast() ? "⚡" : "🐢", "sub:fast:" + s.getId()),
                     button(toggle, "sub:tgl:" + s.getId()),
                     button("✏️", "sub:edit:" + s.getId()),
                     button("🗑", "sub:del:" + s.getId())
@@ -715,6 +719,11 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
                 Boolean active = subscriptionService.toggleActive(user.getId(), Long.parseLong(data.substring(8)));
                 ack(cb, active == null ? "Не найдено" : (active ? "▶️ Возобновлено" : "⏸ На паузе"));
                 sendSubsPage(chatId, user, 0);
+            } else if (data.startsWith("sub:fast:")) {
+                Boolean fast = subscriptionService.toggleFast(user.getId(), Long.parseLong(data.substring(9)));
+                ack(cb, fast == null ? "Не найдено"
+                        : (fast ? "⚡ Снайпер-режим: проверка каждые несколько секунд" : "🐢 Обычный режим"));
+                sendSubsPage(chatId, user, 0);
             } else if (data.startsWith("sub:edit:")) {
                 pending.put(chatId, new Pending(Pending.Type.EDIT_SUB_LABEL, Long.parseLong(data.substring(9))));
                 send(chatId, "✏️ Отправьте новое название для подписки (или /subs чтобы отменить).");
@@ -781,7 +790,7 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
             VintedItem item = parserService.parseVintedUrl(w.getVintedUrl());
             historyService.save(user.getId(), item);
             watchlistService.applySnapshot(user.getId(), watchId, item);
-            send(chatId, formatter.formatItem(item));
+            sendListingCard(SendTarget.chat(chatId), ListingCard.of(item), null, null);
         } catch (VintedParseException e) {
             send(chatId, userFacingError(e));
         } catch (Exception e) {
@@ -857,6 +866,62 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
         return kb;
     }
 
+    /**
+     * Sends a compact listing card: photo + caption (title & price) + a
+     * "🔗 Перейти на Vinted" link button. If a photo is missing or Telegram
+     * can't fetch it, falls back to a text message with the same caption/buttons.
+     *
+     * @param saveParsedItemId if non-null, adds a "⭐ В список" save button
+     */
+    private void sendListingCard(SendTarget target, ListingCard card, String header, Long saveParsedItemId) {
+        String caption = formatter.cardCaption(card, header);
+        InlineKeyboardMarkup markup = listingKeyboard(card.url(), saveParsedItemId);
+
+        String photo = card.photoUrl();
+        if (photo != null && !photo.isBlank()) {
+            SendPhoto sp = new SendPhoto();
+            sp.setChatId(target.chatId().toString());
+            if (target.messageThreadId() != null) {
+                sp.setMessageThreadId(target.messageThreadId().intValue());
+            }
+            sp.setPhoto(new InputFile(photo));
+            sp.setCaption(caption);
+            sp.setParseMode(ParseMode.HTML);
+            sp.setReplyMarkup(markup);
+            try {
+                dispatch(sp);
+                return;
+            } catch (TelegramApiException e) {
+                // Telegram couldn't fetch the image — fall back to a text card.
+                log.debug("sendPhoto failed ({}), falling back to text: {}", photo, e.getMessage());
+            }
+        }
+        send(target, caption, markup);
+    }
+
+    private InlineKeyboardMarkup listingKeyboard(String url, Long saveParsedItemId) {
+        List<List<InlineKeyboardButton>> rows = new ArrayList<>();
+        if (url != null && !url.isBlank()) {
+            rows.add(List.of(urlButton("🔗 Перейти на Vinted", url)));
+        }
+        if (saveParsedItemId != null) {
+            rows.add(List.of(button("⭐ В список", "save:" + saveParsedItemId)));
+        }
+        InlineKeyboardMarkup m = new InlineKeyboardMarkup();
+        m.setKeyboard(rows);
+        return m;
+    }
+
+    private InlineKeyboardButton urlButton(String text, String url) {
+        InlineKeyboardButton b = new InlineKeyboardButton(text);
+        b.setUrl(url);
+        return b;
+    }
+
+    protected void dispatch(SendPhoto photo) throws TelegramApiException {
+        super.execute(photo);
+    }
+
     protected void dispatch(SendMessage msg) throws TelegramApiException {
         super.execute(msg);
     }
@@ -874,21 +939,6 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
         } catch (TelegramApiException e) {
             log.debug("answerCallbackQuery failed: {}", e.getMessage());
         }
-    }
-
-    private InlineKeyboardMarkup saveButton(Long parsedItemId) {
-        InlineKeyboardMarkup m = new InlineKeyboardMarkup();
-        m.setKeyboard(List.of(List.of(button("⭐ В список", "save:" + parsedItemId))));
-        return m;
-    }
-
-    private InlineKeyboardMarkup saveOrManageKeyboard(Long parsedItemId, WatchlistService.AddResult r) {
-        String label = r == WatchlistService.AddResult.ADDED ? "✅ В списке" : "⭐ В список";
-        InlineKeyboardMarkup m = new InlineKeyboardMarkup();
-        m.setKeyboard(List.of(List.of(
-                button(label, "save:" + parsedItemId),
-                button("📋 Открыть список", "wl:list:0"))));
-        return m;
     }
 
     private InlineKeyboardButton button(String text, String data) {
@@ -970,8 +1020,7 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
                 настройку (темы под каждый поиск).
 
                 <b>Команды:</b> /add · /subs · /list · /history · /stats · /setup
-                <b>Лимиты (free):</b> 10 запросов/час, до """
-                + SearchSubscriptionService.MAX_PER_USER + " подписок.";
+                <b>Подписок:</b> без ограничений.""";
     }
 
     private String whereToGetLinkMessage() {

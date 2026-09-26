@@ -43,6 +43,10 @@ vinted:
     max-retries: 3
     # Optional HTTP/SOCKS proxy, e.g. http://user:pass@host:port
     proxy: ${VINTED_PROXY:}
+    # Proxy pool for the catalog poller (rotated per request, one session per proxy).
+    # More IPs = more request budget = safely faster polling. Residential > datacenter.
+    proxies: ${VINTED_PROXIES:}
+    proxy-cooldown-ms: ${VINTED_PROXY_COOLDOWN_MS:120000}
     image-cache-dir: ${IMAGE_CACHE_DIR:/tmp/vinted_images}
     referer: https://www.vinted.com/
     accept-language: en-US,en;q=0.9
@@ -50,14 +54,21 @@ vinted:
     # Near-real-time polling of saved catalog searches via Vinted's JSON API
     # (~40 KB per poll). New listings are pushed to the chat within seconds.
     enabled: ${MONITOR_ENABLED:true}
-    interval-ms: ${MONITOR_INTERVAL_MS:20000}    # 20 seconds
+    interval-ms: ${MONITOR_INTERVAL_MS:20000}    # 20 seconds (normal subscriptions)
+    snipe-interval-ms: ${MONITOR_SNIPE_INTERVAL_MS:5000}   # ⚡ snipe-mode subscriptions
+    requests-per-minute-per-ip: ${MONITOR_RPM_PER_IP:20}  # safe budget; snipe interval stretches to respect it
+    tick-ms: 1000                                           # how often due subscriptions are picked up
     initial-delay-ms: 15000
     max-new-per-cycle: 5
     per-page: 24
-    backoff-ms: ${MONITOR_BACKOFF_MS:180000}     # pause after anti-bot block
+    backoff-ms: ${MONITOR_BACKOFF_MS:180000}     # pause after anti-bot block (now scoped to the blocked host only)
+    max-concurrent-checks: ${MONITOR_MAX_CONCURRENT_CHECKS:8}     # total parallel subscription checks
+    max-concurrent-per-host: ${MONITOR_MAX_CONCURRENT_PER_HOST:2} # cap per Vinted domain, avoids bursty request patterns
 
 rate-limit:
-  free-requests-per-hour: 10
+  # Cap on manual actions (parse / add search / check-now) per user per hour.
+  # High default so a personal bot never trips it; lower it for a public deploy.
+  free-requests-per-hour: ${FREE_REQUESTS_PER_HOUR:1000}
 
 logging:
   level:

@@ -18,14 +18,13 @@ import java.util.*;
 @RequiredArgsConstructor
 public class SearchSubscriptionService {
 
-    public static final int MAX_PER_USER = 10;
     /** Cap of remembered item ids per subscription (newest first). */
     public static final int MAX_SEEN_IDS = 300;
 
     private final SearchSubscriptionRepository repository;
     private final ObjectMapper objectMapper;
 
-    public enum AddResult { ADDED, ALREADY_EXISTS, LIMIT_REACHED }
+    public enum AddResult { ADDED, ALREADY_EXISTS }
 
     /** Immutable delivery + seed context for creating a subscription. */
     public record NewSubscription(Long userId, String normalizedUrl, String label,
@@ -43,9 +42,6 @@ public class SearchSubscriptionService {
     public AddResult create(NewSubscription ns) {
         if (repository.existsByUserIdAndCatalogUrl(ns.userId(), ns.normalizedUrl())) {
             return AddResult.ALREADY_EXISTS;
-        }
-        if (repository.countByUserId(ns.userId()) >= MAX_PER_USER) {
-            return AddResult.LIMIT_REACHED;
         }
         repository.save(SearchSubscription.builder()
                 .userId(ns.userId())
@@ -69,6 +65,16 @@ public class SearchSubscriptionService {
             s.setActive(!s.isActive());
             repository.save(s);
             return s.isActive();
+        }).orElse(null);
+    }
+
+    /** Toggle snipe mode. Returns the new fast state, or null if not found. */
+    @Transactional
+    public Boolean toggleFast(Long userId, Long id) {
+        return repository.findByIdAndUserId(id, userId).map(s -> {
+            s.setFast(!s.isFast());
+            repository.save(s);
+            return s.isFast();
         }).orElse(null);
     }
 

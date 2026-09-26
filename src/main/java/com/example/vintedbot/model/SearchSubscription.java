@@ -58,6 +58,10 @@ public class SearchSubscription {
     @Column(name = "active", nullable = false)
     private boolean active;
 
+    /** Snipe mode: polled at {@code vinted.monitor.snipe-interval-ms} instead of the default interval. */
+    @Column(name = "fast", nullable = false)
+    private boolean fast;
+
     @PrePersist
     void prePersist() {
         if (createdAt == null) {

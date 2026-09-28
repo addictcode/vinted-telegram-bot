@@ -24,9 +24,17 @@ class VintedApiClientTest {
     }
 
     @Test
+    void apiQuery_forcesNewestFirstSoNewListingsAlwaysReachPageOne() {
+        assertThat(VintedApiClient.apiQuery("brand_ids[]=201700&brand_ids[]=304403", 10))
+                .isEqualTo("brand_ids[]=201700&brand_ids[]=304403&order=newest_first&page=1&per_page=10");
+        assertThat(VintedApiClient.apiQuery("search_text=x&order=price_low_to_high", 10))
+                .isEqualTo("search_text=x&order=newest_first&page=1&per_page=10");
+    }
+
+    @Test
     void apiQuery_handlesEmptyQuery() {
-        assertThat(VintedApiClient.apiQuery(null, 24)).isEqualTo("page=1&per_page=24");
-        assertThat(VintedApiClient.apiQuery("", 24)).isEqualTo("page=1&per_page=24");
+        assertThat(VintedApiClient.apiQuery(null, 24)).isEqualTo("order=newest_first&page=1&per_page=24");
+        assertThat(VintedApiClient.apiQuery("", 24)).isEqualTo("order=newest_first&page=1&per_page=24");
     }
 
     @Test

@@ -436,19 +436,21 @@ public class VintedApiClient {
     /**
      * Translates the web catalog query into API params: user filters pass
      * through 1:1; volatile params are dropped; paging pinned to page 1.
+     * Order is always newest-first: with any other sort a brand-new listing may
+     * never reach page 1, so the monitor would silently miss it.
      */
     public static String apiQuery(String rawQuery, int perPage) {
         StringBuilder sb = new StringBuilder();
         if (rawQuery != null && !rawQuery.isBlank()) {
             for (String p : rawQuery.split("&")) {
                 String key = p.split("=", 2)[0];
-                if (key.equals("time") || key.equals("page") || key.equals("per_page")) continue;
+                if (key.equals("time") || key.equals("page") || key.equals("per_page") || key.equals("order")) continue;
                 if (!sb.isEmpty()) sb.append('&');
                 sb.append(p);
             }
         }
         if (!sb.isEmpty()) sb.append('&');
-        sb.append("page=1&per_page=").append(perPage);
+        sb.append("order=newest_first&page=1&per_page=").append(perPage);
         return sb.toString();
     }
 

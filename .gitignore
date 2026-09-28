@@ -6,3 +6,9 @@ logs/
 *.iml
 .DS_Store
 /tmp/vinted_images/
+backups/
+proxies.txt
+.classpath
+.project
+.factorypath
+.settings/

@@ -161,6 +161,7 @@ public class MessageFormatter {
         if (s == null) return "";
         return s.replace("&", "&amp;")
                 .replace("<", "&lt;")
-                .replace(">", "&gt;");
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;");
     }
 }

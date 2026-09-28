@@ -24,9 +24,17 @@ class VintedApiClientTest {
     }
 
     @Test
+    void apiQuery_forcesNewestFirstSoNewListingsAlwaysReachPageOne() {
+        assertThat(VintedApiClient.apiQuery("brand_ids[]=201700&brand_ids[]=304403", 10))
+                .isEqualTo("brand_ids[]=201700&brand_ids[]=304403&order=newest_first&page=1&per_page=10");
+        assertThat(VintedApiClient.apiQuery("search_text=x&order=price_low_to_high", 10))
+                .isEqualTo("search_text=x&order=newest_first&page=1&per_page=10");
+    }
+
+    @Test
     void apiQuery_handlesEmptyQuery() {
-        assertThat(VintedApiClient.apiQuery(null, 24)).isEqualTo("page=1&per_page=24");
-        assertThat(VintedApiClient.apiQuery("", 24)).isEqualTo("page=1&per_page=24");
+        assertThat(VintedApiClient.apiQuery(null, 24)).isEqualTo("order=newest_first&page=1&per_page=24");
+        assertThat(VintedApiClient.apiQuery("", 24)).isEqualTo("order=newest_first&page=1&per_page=24");
     }
 
     @Test
@@ -79,6 +87,13 @@ class VintedApiClientTest {
         p.setProxy("10.0.0.3:3128");
         VintedApiClient pooled = new VintedApiClient(p, new UserAgentRotator(), new ObjectMapper());
         assertThat(pooled.endpointCount()).isEqualTo(3);
+    }
+
+    @Test
+    void parseItems_failsLoudlyWhenResponseShapeChanges() {
+        org.assertj.core.api.Assertions.assertThatThrownBy(
+                () -> client.parseItems("{\"results\":[]}", "www.vinted.de"))
+                .isInstanceOf(com.example.vintedbot.service.VintedParseException.class);
     }
 
     @Test

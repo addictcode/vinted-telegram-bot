@@ -67,18 +67,7 @@ public class MessageFormatter {
         sb.append("💰 <b>").append(formatPrice(card.price(), card.currency())).append("</b>");
         if (card.size() != null && !card.size().isBlank()) sb.append(" · ").append(esc(card.size()));
         if (card.brand() != null && !card.brand().isBlank()) sb.append(" · ").append(esc(card.brand()));
-        if (card.uploadedAt() != null) {
-            sb.append("\n⏱ ").append(formatAge(java.time.Duration.between(card.uploadedAt(), java.time.Instant.now())));
-        }
         return sb.toString();
-    }
-
-    /** "12 сек назад" / "4 мин назад" / "2 ч назад" — how fresh a listing is. */
-    static String formatAge(java.time.Duration age) {
-        long s = Math.max(0, age.toSeconds());
-        if (s < 60) return s + " сек назад";
-        if (s < 3600) return (s / 60) + " мин назад";
-        return (s / 3600) + " ч назад";
     }
 
     /** Compact card built from catalog-API data (no item-page fetch → instant). */

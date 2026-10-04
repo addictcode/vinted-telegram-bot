@@ -411,17 +411,11 @@ public class SearchMonitorService {
                 }
                 sendFailures.remove(sub.getId() + ":" + s.getId());
                 long telegramMs = System.currentTimeMillis() - sendStart;
-                if (s.getUploadedAt() != null) {
-                    // The real speed metric: time from Vinted upload to our Telegram push.
-                    log.info("Sub {}: item {} pushed {} s after upload (telegram {} ms)", sub.getId(), s.getId(),
-                            Duration.between(s.getUploadedAt(), Instant.now()).toSeconds(), telegramMs);
-                } else {
-                    log.info("Sub {}: item {} pushed (telegram {} ms)", sub.getId(), s.getId(), telegramMs);
-                }
+                log.info("Sub {}: item {} pushed (telegram {} ms)", sub.getId(), s.getId(), telegramMs);
                 saveToHistory(sub.getUserId(), s);
                 sent++;
             }
-            log.info("Sub {}: {} new listing(s), pushed {}, deferred {} (api)",
+            log.info("Sub {}: {} new listing(s), pushed {}, deferred {} (catalog)",
                     sub.getId(), fresh.size(), sent, undelivered.size());
         }
         subscriptions.markCheckedIds(sub, idsOf(summaries).stream().filter(id -> !undelivered.contains(id)).toList());

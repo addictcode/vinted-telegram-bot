@@ -36,12 +36,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.GZIPInputStream;
 
 /**
- * Lightweight client for Vinted's internal catalog JSON API
- * ({@code /api/v2/catalog/items}). ~200× smaller payload than the HTML page,
- * which makes near-real-time polling of saved searches feasible.
+ * Catalog poller. Vinted dropped the JSON catalog API ({@code /api/v2/catalog/items}
+ * now 404s), so listings are read from the server-rendered catalog page, where
+ * Next.js embeds them as JSON (~530 KB gzipped, ~0.9 s per poll).
  *
  * Flow: bootstrap an anonymous session (cookies) from the domain homepage,
- * then query the API with those cookies. Requests rotate across the configured
+ * then fetch the catalog page with those cookies. Requests rotate across the configured
  * proxy endpoints (or go direct when none are set); each endpoint keeps its own
  * per-domain session, since anti-bot systems tie cookies to the client IP.
  */
@@ -173,9 +173,9 @@ public class VintedApiClient {
     private List<CatalogItemSummary> callApi(String host, Endpoint ep, String rawQuery, int perPage,
                                              boolean retryOnAuthFail) throws Exception {
         Session session = obtainSession(host, ep);
-        String api = "https://" + host + "/api/v2/catalog/items?" + apiQuery(rawQuery, perPage);
+        String page = "https://" + host + "/catalog?" + catalogQuery(rawQuery);
 
-        HttpResult res = get(ep, api, session, "https://" + host + "/catalog");
+        HttpResult res = get(ep, page, session, "https://" + host + "/catalog");
 
         int code = res.status();
         if (code == 401 || code == 403 || code == 429) {
@@ -186,13 +186,14 @@ public class VintedApiClient {
                 return callApi(host, ep, rawQuery, perPage, false);
             }
             throw new VintedParseException(VintedParseException.Reason.BLOCKED,
-                    "Catalog API returned HTTP " + code);
+                    "Catalog page returned HTTP " + code);
         }
         if (code != 200) {
             throw new VintedParseException(VintedParseException.Reason.UNKNOWN,
-                    "Catalog API returned HTTP " + code);
+                    "Catalog page returned HTTP " + code);
         }
-        return parseItems(res.body(), host);
+        List<CatalogItemSummary> items = parseCatalogHtml(res.body(), host);
+        return items.size() > perPage ? items.subList(0, perPage) : items;
     }
 
     record HttpResult(int status, String body) {
@@ -206,8 +207,9 @@ public class VintedApiClient {
             Connection.Response r = connect(url, ep)
                     .userAgent(session.userAgent())
                     .header("Cookie", cookie)
-                    .header("Accept", "application/json, text/plain, */*")
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                     .header("Accept-Language", props.getAcceptLanguage())
+                    .header("RSC", "1")
                     .referrer(referer)
                     .ignoreContentType(true)
                     .ignoreHttpErrors(true)
@@ -220,9 +222,11 @@ public class VintedApiClient {
         HttpRequest.Builder req = HttpRequest.newBuilder(URI.create(url))
                 .timeout(Duration.ofMillis(TIMEOUT_MS))
                 .header("User-Agent", session.userAgent())
-                .header("Accept", "application/json, text/plain, */*")
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
                 .header("Accept-Language", props.getAcceptLanguage())
                 .header("Accept-Encoding", "gzip")
+                // Ask Next.js for the bare flight payload (no HTML): ~40% faster, slightly smaller.
+                .header("RSC", "1")
                 .header("Referer", referer)
                 .GET();
         if (!cookie.isEmpty()) req.header("Cookie", cookie);
@@ -434,12 +438,11 @@ public class VintedApiClient {
     }
 
     /**
-     * Translates the web catalog query into API params: user filters pass
-     * through 1:1; volatile params are dropped; paging pinned to page 1.
-     * Order is always newest-first: with any other sort a brand-new listing may
-     * never reach page 1, so the monitor would silently miss it.
+     * Catalog page query: the user's filters pass through 1:1, volatile params
+     * (time/page/per_page) are dropped, and order is always newest-first — with
+     * any other sort a brand-new listing may never reach page 1 and is missed.
      */
-    public static String apiQuery(String rawQuery, int perPage) {
+    public static String catalogQuery(String rawQuery) {
         StringBuilder sb = new StringBuilder();
         if (rawQuery != null && !rawQuery.isBlank()) {
             for (String p : rawQuery.split("&")) {
@@ -450,52 +453,95 @@ public class VintedApiClient {
             }
         }
         if (!sb.isEmpty()) sb.append('&');
-        sb.append("order=newest_first&page=1&per_page=").append(perPage);
+        sb.append("order=newest_first");
         return sb.toString();
     }
 
-    /** Parses the API JSON body into summaries. */
-    public List<CatalogItemSummary> parseItems(String json, String host) throws Exception {
-        JsonNode root = objectMapper.readTree(json);
-        JsonNode items = root.path("items");
-        if (!items.isArray()) {
-            // Response shape changed: fail loudly (→ HTML fallback + log) instead of reading as "nothing new".
+    private static final String FLIGHT_MARKER = "self.__next_f.push([1,\"";
+    private static final String ITEMS_MARKER = "\"items\":{\"items\":[";
+
+    /**
+     * Vinted removed the JSON catalog API; listings are now server-rendered and
+     * embedded in the page as a Next.js flight payload. This pulls the catalog's
+     * item array out of it, newest first, skipping promoted (ad) slots.
+     */
+    public List<CatalogItemSummary> parseCatalogHtml(String body, String host) throws Exception {
+        // RSC responses are the flight payload itself; full HTML pages embed it in script chunks.
+        String flight = body.contains(FLIGHT_MARKER) ? flightPayload(body) : body;
+        int at = flight.indexOf(ITEMS_MARKER);
+        if (at < 0) {
+            // Shape changed or a challenge page: fail loudly instead of reading as "nothing new".
             throw new VintedParseException(VintedParseException.Reason.UNKNOWN,
-                    "Catalog API response has no items array");
+                    "Catalog page has no items payload");
+        }
+        JsonNode items;
+        try (var parser = objectMapper.createParser(flight.substring(flight.indexOf('[', at)))) {
+            items = objectMapper.readTree(parser);
         }
         List<CatalogItemSummary> out = new ArrayList<>();
-        for (JsonNode it : items) {
-            String url = it.path("url").asText("");
-            if (url.isEmpty()) {
-                String path = it.path("path").asText("");
-                if (!path.isEmpty()) url = "https://" + host + path;
-            }
+        for (JsonNode el : items) {
+            JsonNode p = el.path("productItem");
+            if (p.path("isPromoted").asBoolean(false)) continue;
+            String id = textOrNull(p.path("id"));
+            if (id == null) continue;
+            String url = textOrNull(p.path("url"));
+            if (url != null && url.startsWith("/")) url = "https://" + host + url;
+
             Double price = null;
-            String currency = null;
-            JsonNode priceNode = it.path("price");
-            if (priceNode.isObject()) {
-                try {
-                    price = Double.parseDouble(priceNode.path("amount").asText());
-                } catch (NumberFormatException ignore) {
-                    // leave null
-                }
-                currency = textOrNull(priceNode.path("currency_code"));
+            try {
+                price = Double.parseDouble(p.path("price").path("amount").asText());
+            } catch (NumberFormatException ignore) {
+                // leave null
             }
-            long uploadedEpoch = it.path("photo").path("high_resolution").path("timestamp").asLong(0);
+            String photo = textOrNull(p.path("photos").path(0).path("url"));
+            if (photo == null) photo = textOrNull(p.path("thumbnailUrl"));
+
+            // itemBox.secondLine is "size · condition", or just the condition when there's no size.
+            String size = null;
+            String condition = null;
+            String second = textOrNull(p.path("itemBox").path("secondLine"));
+            if (second != null) {
+                String[] parts = second.split(" · ");
+                condition = parts[parts.length - 1].trim();
+                if (parts.length > 1) size = parts[0].trim();
+            }
             out.add(CatalogItemSummary.builder()
-                    .id(it.path("id").asText(null))
+                    .id(id)
                     .url(url)
-                    .title(textOrNull(it.path("title")))
+                    .title(textOrNull(p.path("title")))
                     .price(price)
-                    .currency(currency)
-                    .brand(textOrNull(it.path("brand_title")))
-                    .size(textOrNull(it.path("size_title")))
-                    .condition(textOrNull(it.path("status")))
-                    .photoUrl(textOrNull(it.path("photo").path("url")))
-                    .uploadedAt(uploadedEpoch > 0 ? Instant.ofEpochSecond(uploadedEpoch) : null)
+                    .currency(textOrNull(p.path("price").path("currencyCode")))
+                    .brand(textOrNull(p.path("itemBox").path("firstLine")))
+                    .size(size)
+                    .condition(condition)
+                    .photoUrl(photo)
                     .build());
         }
         return out;
+    }
+
+    /** Concatenates the page's {@code self.__next_f.push([1,"..."])} string chunks, JSON-unescaped. */
+    String flightPayload(String html) throws Exception {
+        StringBuilder out = new StringBuilder();
+        int i = 0;
+        while ((i = html.indexOf(FLIGHT_MARKER, i)) >= 0) {
+            int open = i + FLIGHT_MARKER.length() - 1;   // the opening quote
+            int j = open + 1;
+            while (j < html.length()) {
+                char c = html.charAt(j);
+                if (c == '\\') {
+                    j += 2;
+                } else if (c == '"') {
+                    break;
+                } else {
+                    j++;
+                }
+            }
+            if (j >= html.length()) break;
+            out.append(objectMapper.readValue(html.substring(open, j + 1), String.class));
+            i = j + 1;
+        }
+        return out.toString();
     }
 
     private String cookieHeader(Map<String, String> cookies) {
@@ -509,7 +555,10 @@ public class VintedApiClient {
     }
 
     private static String textOrNull(JsonNode n) {
-        return n.isValueNode() && !n.isNull() && !n.asText().isBlank() ? n.asText() : null;
+        if (!n.isValueNode() || n.isNull()) return null;
+        String t = n.asText();
+        // Next.js serialises missing values as the literal "$undefined".
+        return t.isBlank() || t.equals("$undefined") ? null : t;
     }
 
     /**

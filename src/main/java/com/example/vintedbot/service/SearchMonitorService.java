@@ -382,7 +382,7 @@ public class SearchMonitorService {
      */
     private int applyApiSummaries(SearchSubscription sub, List<CatalogItemSummary> summaries) {
         Set<String> seen = subscriptions.seenIds(sub);
-        if (seen == null) {   // never checked: seed quietly, don't flood
+        if (seen == null || isStale(sub, seen, idsOf(summaries))) {   // first check or long gap: seed quietly
             subscriptions.markCheckedIds(sub, idsOf(summaries));
             return 0;
         }
@@ -426,7 +426,8 @@ public class SearchMonitorService {
     private int checkOneViaHtml(SearchSubscription sub) {
         List<String> current = parser.fetchCatalogItemUrls(sub.getCatalogUrl());
         Set<String> seen = subscriptions.seenIds(sub);
-        if (seen == null) {
+        if (seen == null || isStale(sub, seen,
+                current.stream().map(VintedParserService::extractItemId).filter(Objects::nonNull).toList())) {
             subscriptions.markChecked(sub, current);
             return 0;
         }
@@ -468,6 +469,23 @@ public class SearchMonitorService {
     }
 
     // ----------------------------------------------------------------- utils
+
+    /**
+     * True when the seen set no longer describes the search: none of the current page
+     * is known AND the last check was long ago (the bot was off). Everything would look
+     * "new", so the caller re-seeds quietly instead of pushing days-old listings. A recent
+     * check with no overlap is just a busy search — then the newest items are pushed.
+     */
+    private boolean isStale(SearchSubscription sub, Set<String> seen, List<String> pageIds) {
+        if (seen.isEmpty() || pageIds.isEmpty() || pageIds.stream().anyMatch(seen::contains)) return false;
+        var last = sub.getLastCheckedAt();
+        boolean longGap = last == null
+                || last.toInstant().isBefore(Instant.now().minusMillis(props.getResyncAfterMs()));
+        if (longGap) {
+            log.info("Sub {}: page has no known listings after a long gap — resyncing quietly", sub.getId());
+        }
+        return longGap;
+    }
 
     /** Counts a failed delivery; false once it failed often enough that the chat is likely dead. */
     private boolean shouldRetry(SearchSubscription sub, String itemKey) {

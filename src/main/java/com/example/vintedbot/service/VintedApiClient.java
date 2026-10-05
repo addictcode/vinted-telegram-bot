@@ -173,7 +173,8 @@ public class VintedApiClient {
     private List<CatalogItemSummary> callApi(String host, Endpoint ep, String rawQuery, int perPage,
                                              boolean retryOnAuthFail) throws Exception {
         Session session = obtainSession(host, ep);
-        String page = "https://" + host + "/catalog?" + catalogQuery(rawQuery);
+        // Bare `_rsc` is what Next.js redirects RSC requests to; sending it upfront saves that 307 hop.
+        String page = "https://" + host + "/catalog?" + catalogQuery(rawQuery) + "&_rsc";
 
         HttpResult res = get(ep, page, session, "https://" + host + "/catalog");
 
@@ -398,7 +399,7 @@ public class VintedApiClient {
             HttpClient.Builder b = HttpClient.newBuilder()
                     .version(HttpClient.Version.HTTP_2)
                     .connectTimeout(Duration.ofMillis(TIMEOUT_MS))
-                    .followRedirects(HttpClient.Redirect.NEVER);
+                    .followRedirects(HttpClient.Redirect.NORMAL);
             if (ep.proxy() != null) {
                 b.proxy(ProxySelector.of((InetSocketAddress) ep.proxy().address()))
                         .authenticator(PROXY_AUTHENTICATOR);

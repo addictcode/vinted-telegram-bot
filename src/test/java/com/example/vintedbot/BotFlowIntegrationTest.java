@@ -401,6 +401,25 @@ class BotFlowIntegrationTest {
     }
 
     @Test
+    void monitor_afterLongDowntimeResyncsQuietlyInsteadOfFlooding() {
+        stubApi.page = new ArrayList<>(List.of("https://www.vinted.de/items/6001-a"));
+        bot.onUpdateReceived(text(CATALOG_URL));
+        var sub = searchSubscriptionRepository.findAll().get(0);
+        sub.setLastCheckedAt(java.time.OffsetDateTime.now().minusDays(9));   // bot was off for days
+        searchSubscriptionRepository.save(sub);
+        sent.clear();
+
+        stubApi.page = List.of("https://www.vinted.de/items/6004-old", "https://www.vinted.de/items/6003-old",
+                "https://www.vinted.de/items/6002-old");
+        assertThat(monitor.checkAll()).isZero();      // whole page unknown after a long gap: no backlog flood
+        assertThat(sent).isEmpty();
+
+        stubApi.page = List.of("https://www.vinted.de/items/6005-new", "https://www.vinted.de/items/6004-old");
+        assertThat(monitor.checkAll()).isEqualTo(1);  // real new listings flow again
+        assertThat(sent.get(0).getText()).contains("Item 6005");
+    }
+
+    @Test
     void monitor_failedTelegramSendIsRetriedNextCycle() {
         stubApi.page = new ArrayList<>(List.of("https://www.vinted.de/items/3001-a"));
         bot.onUpdateReceived(text(CATALOG_URL));

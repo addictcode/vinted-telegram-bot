@@ -6,11 +6,11 @@ services:
       POSTGRES_DB: ${DB_NAME:-vinted}
       POSTGRES_USER: ${DB_USER:-vinted}
       POSTGRES_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set in .env}
-    # Bound to localhost only: on a VPS a published 5432 would expose the DB to the internet.
+    # Localhost only, for a bot running natively on the host (deploy/run-local.sh). Never 0.0.0.0.
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${DB_HOST_PORT:-15432}:5432"
     volumes:
-      - pgdata:/var/lib/postgresql
+      - pgdata18:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-vinted} -d ${DB_NAME:-vinted}"]
       interval: 5s
@@ -36,6 +36,8 @@ services:
       VINTED_PROXY: ${VINTED_PROXY:-}
       VINTED_PROXIES: ${VINTED_PROXIES:-}
       MONITOR_RPM_PER_IP: ${MONITOR_RPM_PER_IP:-20}
+      MONITOR_INTERVAL_MS: ${MONITOR_INTERVAL_MS:-20000}
+      ALERT_CHAT_ID: ${ALERT_CHAT_ID:-}
       JAVA_OPTS: ${JAVA_OPTS:--XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=25 -XX:MaxMetaspaceSize=128m -XX:+ExitOnOutOfMemoryError}
     mem_limit: 1g
     volumes:
@@ -43,5 +45,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  pgdata:
+  # Postgres 18 data. An older `pgdata` volume from Postgres 16 is left untouched.
+  pgdata18:
   botlogs:

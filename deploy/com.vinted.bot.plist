@@ -11,8 +11,8 @@
   Stop:
     launchctl unload ~/Library/LaunchAgents/com.vinted.bot.plist
 
-  Tip: to keep polling while the lid is closed, run `caffeinate -s` or disable
-  App Nap / sleep for this process.
+  run-local.sh wraps the JVM in `caffeinate -i`, so the Mac won't idle-sleep while
+  the bot runs; on battery, closing the lid still sleeps it.
 -->
 <plist version="1.0">
 <dict>
@@ -21,17 +21,17 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/dmitrijsajbakov/Desktop/12345678/vinted-telegram-bot/deploy/run-local.sh</string>
+        <string>/Users/dmitrijsajbakov/Desktop/vinted-telegram-bot/deploy/run-local.sh</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/dmitrijsajbakov/Desktop/12345678/vinted-telegram-bot</string>
+    <string>/Users/dmitrijsajbakov/Desktop/vinted-telegram-bot</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/Users/dmitrijsajbakov/Desktop/12345678/vinted-telegram-bot/logs/launchd.out.log</string>
+    <string>/Users/dmitrijsajbakov/Desktop/vinted-telegram-bot/logs/launchd.out.log</string>
     <key>StandardErrorPath</key>
-    <string>/Users/dmitrijsajbakov/Desktop/12345678/vinted-telegram-bot/logs/launchd.err.log</string>
+    <string>/Users/dmitrijsajbakov/Desktop/vinted-telegram-bot/logs/launchd.err.log</string>
 </dict>
 </plist>

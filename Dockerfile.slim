@@ -16,8 +16,11 @@ WORKDIR /app
 
 ENV SELENIUM_ENABLED=false \
     IMAGE_CACHE_DIR=/tmp/vinted_images \
-    JAVA_OPTS="-XX:MaxRAMPercentage=75"
+    JAVA_OPTS="-XX:MaxRAMPercentage=50 -XX:InitialRAMPercentage=25 -XX:MaxMetaspaceSize=128m -XX:+ExitOnOutOfMemoryError"
 
-COPY --from=build /app/target/vinted-telegram-bot-*.jar app.jar
+# Run as an unprivileged user: a compromised dependency shouldn't get root in the container.
+RUN useradd --system --uid 10001 --home-dir /app app && mkdir -p /app/logs && chown -R app /app
+COPY --from=build --chown=app /app/target/vinted-telegram-bot-*.jar app.jar
+USER app
 STOPSIGNAL SIGTERM
 ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar /app/app.jar"]

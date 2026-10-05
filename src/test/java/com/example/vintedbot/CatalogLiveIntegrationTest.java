@@ -38,9 +38,7 @@ class CatalogLiveIntegrationTest {
         items.stream().limit(3).forEach(s -> System.out.println(
                 "  " + s.getId() + " | " + s.getTitle() + " | " + s.getPrice() + " "
                         + s.getCurrency() + " | " + s.getBrand() + " | " + s.getSize()
-                        + " | " + s.getCondition()
-                        + " | age " + (s.getUploadedAt() == null ? "n/a"
-                        : java.time.Duration.between(s.getUploadedAt(), java.time.Instant.now()).toSeconds() + "s")));
+                        + " | " + s.getCondition()));
 
         assertThat(items).isNotEmpty();
         assertThat(items.get(0).getId()).isNotBlank();

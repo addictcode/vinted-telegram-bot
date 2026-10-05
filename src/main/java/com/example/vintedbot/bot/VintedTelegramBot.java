@@ -110,11 +110,12 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
         this.monitorService = monitorService;
         this.formatter = formatter;
         monitorService.setNotifier(this::pushCard);
+        monitorService.setAlerter((chatId, html) -> trySend(SendTarget.chat(chatId), html, null));
     }
 
-    /** Delivery channel the monitor uses to push a listing into a chat/topic. */
-    public void pushCard(SendTarget target, String header, ListingCard card) {
-        sendListingCard(target, card, header, null);
+    /** Delivery channel the monitor uses to push a listing; false = not delivered, retry later. */
+    public boolean pushCard(SendTarget target, String header, ListingCard card) {
+        return sendListingCard(target, card, header, null);
     }
 
     @Override
@@ -814,6 +815,11 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
     }
 
     private void send(SendTarget target, String text, InlineKeyboardMarkup markup) {
+        trySend(target, text, markup);
+    }
+
+    /** Like {@link #send} but reports whether Telegram accepted the message. */
+    private boolean trySend(SendTarget target, String text, InlineKeyboardMarkup markup) {
         SendMessage msg = new SendMessage();
         msg.setChatId(target.chatId().toString());
         if (target.messageThreadId() != null) {
@@ -825,8 +831,10 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
         if (markup != null) msg.setReplyMarkup(markup);
         try {
             dispatch(msg);
+            return true;
         } catch (TelegramApiException e) {
             log.error("Failed to send message to {}: {}", target.chatId(), e.getMessage());
+            return false;
         }
     }
 
@@ -873,7 +881,7 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
      *
      * @param saveParsedItemId if non-null, adds a "⭐ В список" save button
      */
-    private void sendListingCard(SendTarget target, ListingCard card, String header, Long saveParsedItemId) {
+    private boolean sendListingCard(SendTarget target, ListingCard card, String header, Long saveParsedItemId) {
         String caption = formatter.cardCaption(card, header);
         InlineKeyboardMarkup markup = listingKeyboard(card.url(), saveParsedItemId);
 
@@ -890,13 +898,13 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
             sp.setReplyMarkup(markup);
             try {
                 dispatch(sp);
-                return;
+                return true;
             } catch (TelegramApiException e) {
                 // Telegram couldn't fetch the image — fall back to a text card.
                 log.debug("sendPhoto failed ({}), falling back to text: {}", photo, e.getMessage());
             }
         }
-        send(target, caption, markup);
+        return trySend(target, caption, markup);
     }
 
     private InlineKeyboardMarkup listingKeyboard(String url, Long saveParsedItemId) {
@@ -962,7 +970,8 @@ public class VintedTelegramBot extends TelegramLongPollingBot {
     }
 
     private String esc(String s) {
-        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;");
+        return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                .replace("\"", "&quot;");
     }
 
     private String userFacingError(VintedParseException e) {

@@ -64,7 +64,12 @@ class BotFlowIntegrationTest {
             super(bp, us, rl, ps, api, hs, ws, ss, ms, mf);
             this.sent = sent; this.acks = acks;
         }
-        @Override protected void dispatch(SendMessage m) { sent.add(m); }
+        /** When true, every send fails like a Telegram rate limit / outage. */
+        boolean failSends = false;
+        @Override protected void dispatch(SendMessage m) throws org.telegram.telegrambots.meta.exceptions.TelegramApiException {
+            if (failSends) throw new org.telegram.telegrambots.meta.exceptions.TelegramApiException("429 Too Many Requests");
+            sent.add(m);
+        }
         @Override protected void dispatch(SendPhoto p) { photos.add(p); }
         @Override protected void dispatch(AnswerCallbackQuery a) { acks.add(a); }
         @Override protected Integer createForumTopic(Long chatId, String name) {
@@ -365,7 +370,8 @@ class BotFlowIntegrationTest {
         bot.onUpdateReceived(callback("sub:fast:" + frId));
         assertThat(searchSubscriptionRepository.findById(frId).orElseThrow().isFast()).isTrue();
 
-        monitorProps.setSnipeIntervalMs(0);            // snipe subs are due again immediately
+        monitorProps.setSnipeMinIntervalMs(0);         // no floor, and a huge request budget,
+        monitorProps.setRequestsPerMinutePerIp(1_000_000); // so snipe subs are due again immediately
         stubApi.calls = 0;
         monitor.checkDue();                            // first tick: both are due
         assertThat(stubApi.calls).isEqualTo(2);
@@ -373,6 +379,90 @@ class BotFlowIntegrationTest {
         stubApi.calls = 0;
         monitor.checkDue();                            // normal one waits its 20 s, snipe one goes again
         assertThat(stubApi.calls).isEqualTo(1);
+    }
+
+    @Test
+    void monitor_listingsBeyondPerCycleCapAreDeferredNotLost() {
+        monitorProps.setMaxNewPerCycle(1);
+        stubApi.page = new ArrayList<>(List.of("https://www.vinted.de/items/2001-a"));
+        bot.onUpdateReceived(text(CATALOG_URL));   // seeds 2001
+        sent.clear();
+
+        stubApi.page = List.of("https://www.vinted.de/items/2004-new", "https://www.vinted.de/items/2003-new",
+                "https://www.vinted.de/items/2002-new", "https://www.vinted.de/items/2001-a");
+        assertThat(monitor.checkAll()).isEqualTo(1);
+        assertThat(monitor.checkAll()).isEqualTo(1);
+        assertThat(monitor.checkAll()).isEqualTo(1);
+        assertThat(monitor.checkAll()).isZero();   // all three delivered, nothing re-sent
+        assertThat(sent).extracting(SendMessage::getText)
+                .anySatisfy(t -> assertThat(t).contains("Item 2004"))
+                .anySatisfy(t -> assertThat(t).contains("Item 2003"))
+                .anySatisfy(t -> assertThat(t).contains("Item 2002"));
+    }
+
+    @Test
+    void monitor_afterLongDowntimeResyncsQuietlyInsteadOfFlooding() {
+        stubApi.page = new ArrayList<>(List.of("https://www.vinted.de/items/6001-a"));
+        bot.onUpdateReceived(text(CATALOG_URL));
+        var sub = searchSubscriptionRepository.findAll().get(0);
+        sub.setLastCheckedAt(java.time.OffsetDateTime.now().minusDays(9));   // bot was off for days
+        searchSubscriptionRepository.save(sub);
+        sent.clear();
+
+        stubApi.page = List.of("https://www.vinted.de/items/6004-old", "https://www.vinted.de/items/6003-old",
+                "https://www.vinted.de/items/6002-old");
+        assertThat(monitor.checkAll()).isZero();      // whole page unknown after a long gap: no backlog flood
+        assertThat(sent).isEmpty();
+
+        stubApi.page = List.of("https://www.vinted.de/items/6005-new", "https://www.vinted.de/items/6004-old");
+        assertThat(monitor.checkAll()).isEqualTo(1);  // real new listings flow again
+        assertThat(sent.get(0).getText()).contains("Item 6005");
+    }
+
+    @Test
+    void monitor_failedTelegramSendIsRetriedNextCycle() {
+        stubApi.page = new ArrayList<>(List.of("https://www.vinted.de/items/3001-a"));
+        bot.onUpdateReceived(text(CATALOG_URL));
+        sent.clear();
+        stubApi.page = List.of("https://www.vinted.de/items/3002-new", "https://www.vinted.de/items/3001-a");
+
+        bot.failSends = true;
+        assertThat(monitor.checkAll()).isZero();   // Telegram down: nothing delivered...
+        bot.failSends = false;
+        assertThat(monitor.checkAll()).isEqualTo(1);   // ...and it is not lost
+        assertThat(sent.get(sent.size() - 1).getText()).contains("Item 3002");
+    }
+
+    @Test
+    void monitor_givesUpOnListingAfterRepeatedDeliveryFailures() {
+        stubApi.page = new ArrayList<>(List.of("https://www.vinted.de/items/5001-a"));
+        bot.onUpdateReceived(text(CATALOG_URL));
+        stubApi.page = List.of("https://www.vinted.de/items/5002-new", "https://www.vinted.de/items/5001-a");
+        bot.failSends = true;
+        for (int i = 0; i < 5; i++) monitor.checkAll();   // chat unreachable: retried, then dropped
+        bot.failSends = false;
+        sent.clear();
+        assertThat(monitor.checkAll()).isZero();           // no endless retry once given up
+    }
+
+    @Test
+    void monitor_alertsOwnerOnLongBlockAndOnRecovery() {
+        stubApi.page = new ArrayList<>(List.of("https://www.vinted.de/items/4001-a"));
+        bot.onUpdateReceived(text(CATALOG_URL));   // registers the owner (first user)
+        sent.clear();
+        monitorProps.setBlockAlertAfterMs(0);
+        monitorProps.setBackoffMs(0);
+        monitorProps.setIntervalMs(0);               // the sub is due again on every tick
+
+        stubApi.blockedHost = "www.vinted.de";
+        monitor.checkDue();                          // block recorded
+        monitor.checkDue();                          // block older than threshold → alert
+        assertThat(sent).anyMatch(m -> m.getText().contains("блокирует"));
+
+        stubApi.blockedHost = null;
+        monitor.checkDue();
+        monitor.checkDue();
+        assertThat(sent).anyMatch(m -> m.getText().contains("восстановлен"));
     }
 
     @Test

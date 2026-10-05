@@ -10,14 +10,25 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
 public class MonitorProperties {
 
     private boolean enabled = true;
-    /** How often to poll normal subscriptions (near-real-time via the JSON API). */
+    /** How often to poll normal subscriptions. */
     private long intervalMs = 20_000;
-    /** How often to poll snipe-mode ("fast") subscriptions. */
-    private long snipeIntervalMs = 5_000;
+    /** Floor for snipe-mode polling; the real interval is derived from the request budget. */
+    private long snipeMinIntervalMs = 1_000;
+    /** Page size for snipe-mode polls: fewer bytes per request, still far above new-items-per-poll. */
+    private int snipePerPage = 10;
     /** Safe request budget per outbound IP per minute; snipe interval is stretched to respect it. */
     private int requestsPerMinutePerIp = 20;
+    /**
+     * If a search wasn't checked for this long (bot was off) and none of the page is
+     * known, re-seed quietly instead of pushing a backlog of old listings.
+     */
+    private long resyncAfterMs = 600_000;
+    /** Alert the owner when a Vinted host stays blocked this long. */
+    private long blockAlertAfterMs = 600_000;
+    /** Chat for operational alerts; defaults to the first registered user's chat. */
+    private Long alertChatId;
     /** Scheduler tick: how often we look for subscriptions that are due. */
-    private long tickMs = 1_000;
+    private long tickMs = 250;
     private long initialDelayMs = 15_000;
     /** Max new listings pushed per subscription per cycle (anti-flood). */
     private int maxNewPerCycle = 5;

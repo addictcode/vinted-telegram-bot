@@ -55,9 +55,13 @@ vinted:
     # (~40 KB per poll). New listings are pushed to the chat within seconds.
     enabled: ${MONITOR_ENABLED:true}
     interval-ms: ${MONITOR_INTERVAL_MS:20000}    # 20 seconds (normal subscriptions)
-    snipe-interval-ms: ${MONITOR_SNIPE_INTERVAL_MS:5000}   # ⚡ snipe-mode subscriptions
-    requests-per-minute-per-ip: ${MONITOR_RPM_PER_IP:20}  # safe budget; snipe interval stretches to respect it
-    tick-ms: 1000                                           # how often due subscriptions are picked up
+    # ⚡ snipe mode: interval = spare request budget spread across snipe subs, never below this floor
+    snipe-min-interval-ms: ${MONITOR_SNIPE_MIN_INTERVAL_MS:1000}
+    snipe-per-page: ${MONITOR_SNIPE_PER_PAGE:10}
+    requests-per-minute-per-ip: ${MONITOR_RPM_PER_IP:20}  # budget = this × number of proxies
+    tick-ms: ${MONITOR_TICK_MS:250}                         # how often due subscriptions are picked up
+    block-alert-after-ms: ${MONITOR_BLOCK_ALERT_AFTER_MS:600000}  # tell the owner if a host stays blocked
+    alert-chat-id: ${ALERT_CHAT_ID:}                        # default: first registered user's chat
     initial-delay-ms: 15000
     max-new-per-cycle: 5
     per-page: 24

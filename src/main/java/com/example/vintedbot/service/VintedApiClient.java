@@ -10,12 +10,18 @@ import org.jsoup.Connection;
 import org.jsoup.Jsoup;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.io.InputStream;
 import java.net.Authenticator;
 import java.net.InetSocketAddress;
 import java.net.PasswordAuthentication;
 import java.net.Proxy;
 import java.net.URI;
 import java.net.URLDecoder;
+import java.net.ProxySelector;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -27,14 +33,15 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.zip.GZIPInputStream;
 
 /**
- * Lightweight client for Vinted's internal catalog JSON API
- * ({@code /api/v2/catalog/items}). ~200× smaller payload than the HTML page,
- * which makes near-real-time polling of saved searches feasible.
+ * Catalog poller. Vinted dropped the JSON catalog API ({@code /api/v2/catalog/items}
+ * now 404s), so listings are read from the server-rendered catalog page, where
+ * Next.js embeds them as JSON (~530 KB gzipped, ~0.9 s per poll).
  *
  * Flow: bootstrap an anonymous session (cookies) from the domain homepage,
- * then query the API with those cookies. Requests rotate across the configured
+ * then fetch the catalog page with those cookies. Requests rotate across the configured
  * proxy endpoints (or go direct when none are set); each endpoint keeps its own
  * per-domain session, since anti-bot systems tie cookies to the client IP.
  */
@@ -48,14 +55,26 @@ public class VintedApiClient {
     /** Proxy credentials by "host:port", consulted by the JVM-wide Authenticator. */
     private static final Map<String, PasswordAuthentication> PROXY_CREDENTIALS = new ConcurrentHashMap<>();
     private static final AtomicBoolean AUTHENTICATOR_INSTALLED = new AtomicBoolean();
+    /** Answers proxy auth challenges from the credentials parsed out of proxy URLs. */
+    private static final Authenticator PROXY_AUTHENTICATOR = new Authenticator() {
+        @Override
+        protected PasswordAuthentication getPasswordAuthentication() {
+            // Proxy challenges only: never hand proxy credentials to an origin server's 401.
+            if (getRequestorType() != RequestorType.PROXY) return null;
+            return PROXY_CREDENTIALS.get(getRequestingHost() + ":" + getRequestingPort());
+        }
+    };
 
     private final VintedParserProperties props;
     private final UserAgentRotator userAgentRotator;
     private final ObjectMapper objectMapper;
     /** Outbound routes: DIRECT, or one per configured proxy. */
     private final List<Endpoint> endpoints;
+    /** One keep-alive HTTP/2 client per endpoint (none for SOCKS — java.net.http can't tunnel via SOCKS). */
+    private final Map<String, HttpClient> httpClients;
     private final AtomicInteger roundRobin = new AtomicInteger();
     private final ConcurrentHashMap<String, Session> sessions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Object> bootstrapLocks = new ConcurrentHashMap<>();
     /** Per (endpoint, domain) cool-down after a block, so rotation skips burnt routes. */
     private final ConcurrentHashMap<String, Instant> coolingUntil = new ConcurrentHashMap<>();
 
@@ -75,6 +94,7 @@ public class VintedApiClient {
         this.userAgentRotator = userAgentRotator;
         this.objectMapper = objectMapper;
         this.endpoints = buildEndpoints(props);
+        this.httpClients = buildHttpClients(endpoints);
         if (endpoints.get(0).proxy() != null) {
             log.info("Vinted API client rotating across {} proxy endpoint(s)", endpoints.size());
         }
@@ -153,22 +173,12 @@ public class VintedApiClient {
     private List<CatalogItemSummary> callApi(String host, Endpoint ep, String rawQuery, int perPage,
                                              boolean retryOnAuthFail) throws Exception {
         Session session = obtainSession(host, ep);
-        String api = "https://" + host + "/api/v2/catalog/items?" + apiQuery(rawQuery, perPage);
+        // Bare `_rsc` is what Next.js redirects RSC requests to; sending it upfront saves that 307 hop.
+        String page = "https://" + host + "/catalog?" + catalogQuery(rawQuery) + "&_rsc";
 
-        Connection.Response res = connect(api, ep)
-                .userAgent(session.userAgent())
-                .header("Cookie", cookieHeader(session.cookies()))
-                .header("Accept", "application/json, text/plain, */*")
-                .header("Accept-Language", props.getAcceptLanguage())
-                .referrer("https://" + host + "/catalog")
-                .ignoreContentType(true)
-                .ignoreHttpErrors(true)
-                .maxBodySize(0)
-                .timeout(TIMEOUT_MS)
-                .method(Connection.Method.GET)
-                .execute();
+        HttpResult res = get(ep, page, session, "https://" + host + "/catalog");
 
-        int code = res.statusCode();
+        int code = res.status();
         if (code == 401 || code == 403 || code == 429) {
             sessions.remove(key(ep, host));
             if (retryOnAuthFail && code != 429) {
@@ -177,13 +187,62 @@ public class VintedApiClient {
                 return callApi(host, ep, rawQuery, perPage, false);
             }
             throw new VintedParseException(VintedParseException.Reason.BLOCKED,
-                    "Catalog API returned HTTP " + code);
+                    "Catalog page returned HTTP " + code);
         }
         if (code != 200) {
             throw new VintedParseException(VintedParseException.Reason.UNKNOWN,
-                    "Catalog API returned HTTP " + code);
+                    "Catalog page returned HTTP " + code);
         }
-        return parseItems(res.body(), host);
+        List<CatalogItemSummary> items = parseCatalogHtml(res.body(), host);
+        return items.size() > perPage ? items.subList(0, perPage) : items;
+    }
+
+    record HttpResult(int status, String body) {
+    }
+
+    /** Hot-path GET: reuses the endpoint's keep-alive client; SOCKS endpoints fall back to Jsoup. */
+    private HttpResult get(Endpoint ep, String url, Session session, String referer) throws Exception {
+        String cookie = cookieHeader(session.cookies());
+        HttpClient client = httpClients.get(ep.key());
+        if (client == null) {
+            Connection.Response r = connect(url, ep)
+                    .userAgent(session.userAgent())
+                    .header("Cookie", cookie)
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Accept-Language", props.getAcceptLanguage())
+                    .header("RSC", "1")
+                    .referrer(referer)
+                    .ignoreContentType(true)
+                    .ignoreHttpErrors(true)
+                    .maxBodySize(0)
+                    .timeout(TIMEOUT_MS)
+                    .method(Connection.Method.GET)
+                    .execute();
+            return new HttpResult(r.statusCode(), r.body());
+        }
+        HttpRequest.Builder req = HttpRequest.newBuilder(URI.create(url))
+                .timeout(Duration.ofMillis(TIMEOUT_MS))
+                .header("User-Agent", session.userAgent())
+                .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                .header("Accept-Language", props.getAcceptLanguage())
+                .header("Accept-Encoding", "gzip")
+                // Ask Next.js for the bare flight payload (no HTML): ~40% faster, slightly smaller.
+                .header("RSC", "1")
+                .header("Referer", referer)
+                .GET();
+        if (!cookie.isEmpty()) req.header("Cookie", cookie);
+        return send(client, req.build());
+    }
+
+    /** Sends a request and decodes a gzip body (java.net.http doesn't decompress on its own). */
+    static HttpResult send(HttpClient client, HttpRequest request) throws IOException, InterruptedException {
+        HttpResponse<InputStream> resp = client.send(request, HttpResponse.BodyHandlers.ofInputStream());
+        InputStream in = resp.body();
+        boolean gzip = resp.headers().firstValue("Content-Encoding")
+                .map(v -> v.equalsIgnoreCase("gzip")).orElse(false);
+        try (InputStream body = gzip ? new GZIPInputStream(in) : in) {
+            return new HttpResult(resp.statusCode(), new String(body.readAllBytes(), StandardCharsets.UTF_8));
+        }
     }
 
     /**
@@ -198,6 +257,17 @@ public class VintedApiClient {
         if (cached != null && !cached.expired()) {
             return cached;
         }
+        // Single-flight per (endpoint, host): parallel polls must not both spend the 6-hop bootstrap.
+        synchronized (bootstrapLocks.computeIfAbsent(sessionKey, k -> new Object())) {
+            cached = sessions.get(sessionKey);
+            if (cached != null && !cached.expired()) {
+                return cached;
+            }
+            return bootstrapSession(host, ep, sessionKey);
+        }
+    }
+
+    private Session bootstrapSession(String host, Endpoint ep, String sessionKey) throws Exception {
         String ua = userAgentRotator.random();
         Map<String, String> jar = new java.util.LinkedHashMap<>();
         String url = "https://" + host + "/";
@@ -285,6 +355,9 @@ public class VintedApiClient {
             Endpoint ep = parseProxy(spec);
             if (ep != null) out.add(ep);
         }
+        if (out.isEmpty() && !specs.isEmpty()) {
+            log.error("Proxies are configured but none could be parsed — polling DIRECT, expect IP bans");
+        }
         return out.isEmpty() ? List.of(Endpoint.DIRECT) : List.copyOf(out);
     }
 
@@ -316,12 +389,24 @@ public class VintedApiClient {
 
     private static void installAuthenticator() {
         if (!AUTHENTICATOR_INSTALLED.compareAndSet(false, true)) return;
-        Authenticator.setDefault(new Authenticator() {
-            @Override
-            protected PasswordAuthentication getPasswordAuthentication() {
-                return PROXY_CREDENTIALS.get(getRequestingHost() + ":" + getRequestingPort());
+        Authenticator.setDefault(PROXY_AUTHENTICATOR);
+    }
+
+    private static Map<String, HttpClient> buildHttpClients(List<Endpoint> endpoints) {
+        Map<String, HttpClient> clients = new ConcurrentHashMap<>();
+        for (Endpoint ep : endpoints) {
+            if (ep.proxy() != null && ep.proxy().type() != Proxy.Type.HTTP) continue;
+            HttpClient.Builder b = HttpClient.newBuilder()
+                    .version(HttpClient.Version.HTTP_2)
+                    .connectTimeout(Duration.ofMillis(TIMEOUT_MS))
+                    .followRedirects(HttpClient.Redirect.NORMAL);
+            if (ep.proxy() != null) {
+                b.proxy(ProxySelector.of((InetSocketAddress) ep.proxy().address()))
+                        .authenticator(PROXY_AUTHENTICATOR);
             }
-        });
+            clients.put(ep.key(), b.build());
+        }
+        return clients;
     }
 
     private static String nullToEmpty(String s) {
@@ -354,61 +439,110 @@ public class VintedApiClient {
     }
 
     /**
-     * Translates the web catalog query into API params: user filters pass
-     * through 1:1; volatile params are dropped; paging pinned to page 1.
+     * Catalog page query: the user's filters pass through 1:1, volatile params
+     * (time/page/per_page) are dropped, and order is always newest-first — with
+     * any other sort a brand-new listing may never reach page 1 and is missed.
      */
-    public static String apiQuery(String rawQuery, int perPage) {
+    public static String catalogQuery(String rawQuery) {
         StringBuilder sb = new StringBuilder();
         if (rawQuery != null && !rawQuery.isBlank()) {
             for (String p : rawQuery.split("&")) {
                 String key = p.split("=", 2)[0];
-                if (key.equals("time") || key.equals("page") || key.equals("per_page")) continue;
+                if (key.equals("time") || key.equals("page") || key.equals("per_page") || key.equals("order")) continue;
                 if (!sb.isEmpty()) sb.append('&');
                 sb.append(p);
             }
         }
         if (!sb.isEmpty()) sb.append('&');
-        sb.append("page=1&per_page=").append(perPage);
+        sb.append("order=newest_first");
         return sb.toString();
     }
 
-    /** Parses the API JSON body into summaries. */
-    public List<CatalogItemSummary> parseItems(String json, String host) throws Exception {
-        JsonNode root = objectMapper.readTree(json);
-        JsonNode items = root.path("items");
+    private static final String FLIGHT_MARKER = "self.__next_f.push([1,\"";
+    private static final String ITEMS_MARKER = "\"items\":{\"items\":[";
+
+    /**
+     * Vinted removed the JSON catalog API; listings are now server-rendered and
+     * embedded in the page as a Next.js flight payload. This pulls the catalog's
+     * item array out of it, newest first, skipping promoted (ad) slots.
+     */
+    public List<CatalogItemSummary> parseCatalogHtml(String body, String host) throws Exception {
+        // RSC responses are the flight payload itself; full HTML pages embed it in script chunks.
+        String flight = body.contains(FLIGHT_MARKER) ? flightPayload(body) : body;
+        int at = flight.indexOf(ITEMS_MARKER);
+        if (at < 0) {
+            // Shape changed or a challenge page: fail loudly instead of reading as "nothing new".
+            throw new VintedParseException(VintedParseException.Reason.UNKNOWN,
+                    "Catalog page has no items payload");
+        }
+        JsonNode items;
+        try (var parser = objectMapper.createParser(flight.substring(flight.indexOf('[', at)))) {
+            items = objectMapper.readTree(parser);
+        }
         List<CatalogItemSummary> out = new ArrayList<>();
-        for (JsonNode it : items) {
-            String url = it.path("url").asText("");
-            if (url.isEmpty()) {
-                String path = it.path("path").asText("");
-                if (!path.isEmpty()) url = "https://" + host + path;
-            }
+        for (JsonNode el : items) {
+            JsonNode p = el.path("productItem");
+            if (p.path("isPromoted").asBoolean(false)) continue;
+            String id = textOrNull(p.path("id"));
+            if (id == null) continue;
+            String url = textOrNull(p.path("url"));
+            if (url != null && url.startsWith("/")) url = "https://" + host + url;
+
             Double price = null;
-            String currency = null;
-            JsonNode priceNode = it.path("price");
-            if (priceNode.isObject()) {
-                try {
-                    price = Double.parseDouble(priceNode.path("amount").asText());
-                } catch (NumberFormatException ignore) {
-                    // leave null
-                }
-                currency = textOrNull(priceNode.path("currency_code"));
+            try {
+                price = Double.parseDouble(p.path("price").path("amount").asText());
+            } catch (NumberFormatException ignore) {
+                // leave null
             }
-            long uploadedEpoch = it.path("photo").path("high_resolution").path("timestamp").asLong(0);
+            String photo = textOrNull(p.path("photos").path(0).path("url"));
+            if (photo == null) photo = textOrNull(p.path("thumbnailUrl"));
+
+            // itemBox.secondLine is "size · condition", or just the condition when there's no size.
+            String size = null;
+            String condition = null;
+            String second = textOrNull(p.path("itemBox").path("secondLine"));
+            if (second != null) {
+                String[] parts = second.split(" · ");
+                condition = parts[parts.length - 1].trim();
+                if (parts.length > 1) size = parts[0].trim();
+            }
             out.add(CatalogItemSummary.builder()
-                    .id(it.path("id").asText(null))
+                    .id(id)
                     .url(url)
-                    .title(textOrNull(it.path("title")))
+                    .title(textOrNull(p.path("title")))
                     .price(price)
-                    .currency(currency)
-                    .brand(textOrNull(it.path("brand_title")))
-                    .size(textOrNull(it.path("size_title")))
-                    .condition(textOrNull(it.path("status")))
-                    .photoUrl(textOrNull(it.path("photo").path("url")))
-                    .uploadedAt(uploadedEpoch > 0 ? Instant.ofEpochSecond(uploadedEpoch) : null)
+                    .currency(textOrNull(p.path("price").path("currencyCode")))
+                    .brand(textOrNull(p.path("itemBox").path("firstLine")))
+                    .size(size)
+                    .condition(condition)
+                    .photoUrl(photo)
                     .build());
         }
         return out;
+    }
+
+    /** Concatenates the page's {@code self.__next_f.push([1,"..."])} string chunks, JSON-unescaped. */
+    String flightPayload(String html) throws Exception {
+        StringBuilder out = new StringBuilder();
+        int i = 0;
+        while ((i = html.indexOf(FLIGHT_MARKER, i)) >= 0) {
+            int open = i + FLIGHT_MARKER.length() - 1;   // the opening quote
+            int j = open + 1;
+            while (j < html.length()) {
+                char c = html.charAt(j);
+                if (c == '\\') {
+                    j += 2;
+                } else if (c == '"') {
+                    break;
+                } else {
+                    j++;
+                }
+            }
+            if (j >= html.length()) break;
+            out.append(objectMapper.readValue(html.substring(open, j + 1), String.class));
+            i = j + 1;
+        }
+        return out.toString();
     }
 
     private String cookieHeader(Map<String, String> cookies) {
@@ -422,13 +556,21 @@ public class VintedApiClient {
     }
 
     private static String textOrNull(JsonNode n) {
-        return n.isValueNode() && !n.isNull() && !n.asText().isBlank() ? n.asText() : null;
+        if (!n.isValueNode() || n.isNull()) return null;
+        String t = n.asText();
+        // Next.js serialises missing values as the literal "$undefined".
+        return t.isBlank() || t.equals("$undefined") ? null : t;
     }
 
-    /** Light pacing so API polling doesn't look machine-gun regular. */
+    /**
+     * Light pacing so polling doesn't look machine-gun regular. It exists to space
+     * requests on one IP; with N rotating IPs each one is already hit N× less often,
+     * so the pause shrinks accordingly instead of taxing every poll.
+     */
     private void jitter() {
+        int n = endpoints.size();
         try {
-            Thread.sleep(ThreadLocalRandom.current().nextLong(250, 750));
+            Thread.sleep(ThreadLocalRandom.current().nextLong(250 / n, 750 / n + 1));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
